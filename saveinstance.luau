@@ -3622,6 +3622,12 @@ do
 	local CALL_PREFIXES_CAMEL = { "get", "create", "make", "new", "fetch", "build" }
 
 	-- ? `set_volume(p1)` is telling us p1 is the volume
+	-- ? A single letter cannot carry a numeric suffix without reading as a decompiler name
+	local SINGLE_LETTER_WORDS = {
+		v = "item", i = "index", k = "key", n = "count",
+		p = "param", a = "arg", s = "text", u = "value",
+	}
+
 	local SETTER_PREFIXES = { "set_", "update_", "apply_", "handle_", "on_" }
 	local PARAM_KEY_PREFIXES = { "dynamic_", "get_", "set_", "on_", "handle_", "do_" }
 	local TABLE_SUFFIXES = { "DB", "Db", "Data", "Table", "Map", "List", "Cache", "Registry" }
@@ -3650,6 +3656,14 @@ do
 		end
 		local _, close = find(src, "]" .. rep("=", level) .. "]", j + 1, true)
 		return close and close + 1 or #src + 1
+	end
+
+	local TYPE_LEAD_INS = arrayToDict({ ":", "->", "|", "&" })
+
+	--- `arg2: function` is a Luau type, not a function definition -- it opens no block.
+	local function isTypeAnnotationFunction(tokens, i)
+		local prev = tokens[i - 1]
+		return prev ~= nil and prev.t == "sym" and TYPE_LEAD_INS[prev.v] == true
 	end
 
 	--- Splits source into tokens, each carrying the whitespace and comments that preceded it.
@@ -3830,21 +3844,44 @@ do
 		return name
 	end
 
+	-- ? Konstant marks upvalue reads and writes by suffixing the name: `load_upvr`, `v3_upvw`, `Config_upvr_2`
+	local function stripUpvalueSuffix(name)
+		local base = match(name, "^(.+)_upv[rw]?$") or match(name, "^(.+)_upv[rw]?_%d+$")
+		return base or name
+	end
+
 	-- ? Only touch names a decompiler generated -- anything else came from real debug info and already means something
 	local function isPlaceholderName(name)
+		local base = stripUpvalueSuffix(name)
+		if base ~= name then
+			return true -- ? The marker itself is decompiler bookkeeping, so the name is ours to rewrite
+		end
+
 		return (
-			match(name, "^[uvpas]%d+$")
-			or match(name, "^[uv]_u_%d+$")
-			or match(name, "^a_u_%d+$")
-			or match(name, "^var_?%d+$")
-			or match(name, "^arg%d+$")
-			or match(name, "^l_[%w_]-_%d+$")
+			match(base, "^[uvpas]%d+$")
+			or match(base, "^[uvpas]_%d+$")
+			or match(base, "^[uv]_u_%d+$")
+			or match(base, "^a_u_%d+$")
+			or match(base, "^var_?%d+$")
+			or match(base, "^arg%d+$")
+			or match(base, "^l_[%w_]-_%d+$")
 		) ~= nil
 	end
 
-	-- ? Some decompilers keep the original name buried inside the placeholder, as in `l_StarterGui_1`
+	-- ? Some decompilers keep the original name buried in the placeholder, as in `l_StarterGui_1` or `load_upvr`
 	local function embeddedName(name)
-		return match(name, "^l_(.+)_%d+$")
+		local base = stripUpvalueSuffix(name)
+
+		local inner = match(base, "^l_(.+)_%d+$")
+		if inner then
+			return inner
+		end
+
+		if not isPlaceholderName(base) then
+			return base -- ? The base came from real debug info; only the marker was noise
+		end
+
+		return nil
 	end
 
 	--- `create_log` -> `log`, `getState` -> `state`, `can_edit_house` -> itself, `download` -> nothing.
@@ -4022,6 +4059,37 @@ do
 		return i - 1
 	end
 
+	--- `load_upvr` -> `load`. Konstant appends the marker at use sites while the declaration keeps the
+	--- plain name, so undoing it restores the reference rather than renaming anything.
+	---
+	--- Only done when the base name is declared exactly once in the file; a second declaration could
+	--- shadow it, and the restored reference would then bind to the wrong one.
+	local function normalizeUpvalueMarkers(tokens, n, declaredCount)
+		local changed = 0
+
+		for i = 1, n do
+			local tok = tokens[i]
+			if tok.t ~= "name" then
+				continue
+			end
+
+			local base = stripUpvalueSuffix(tok.v)
+			if base == tok.v or declaredCount[base] ~= 1 then
+				continue
+			end
+
+			local prev = tokens[i - 1]
+			if prev and prev.t == "sym" and (prev.v == "." or prev.v == ":") then
+				continue
+			end
+
+			tok.v = base
+			changed += 1
+		end
+
+		return changed
+	end
+
 	--- Returns the parameter names of the `function` token at `at`.
 	local function functionParams(tokens, at)
 		local open, limit = at + 1, at + 12
@@ -4091,7 +4159,7 @@ do
 					end
 					j += 1
 				end
-			elseif tok.v == "function" then
+			elseif tok.v == "function" and not isTypeAnnotationFunction(tokens, i) then
 				local j = i + 1
 				while tokens[j] and not (tokens[j].t == "sym" and tokens[j].v == "(") do
 					j += 1
@@ -4333,6 +4401,48 @@ do
 
 	local fallbackName
 
+	local BOOLEAN_OPERATORS = arrayToDict({ "==", "~=", "<", ">", "<=", ">=" })
+
+	--- name -> the first `name = ...` right hand side, however many times it is written to.
+	local function firstAssignments(tokens, n)
+		local first = {}
+
+		for i = 1, n do
+			local tok = tokens[i]
+			if tok.t ~= "name" or KEYWORDS[tok.v] or first[tok.v] then
+				continue
+			end
+
+			local prev, nextTok = tokens[i - 1], tokens[i + 1]
+			if prev and prev.t == "sym" and (prev.v == "." or prev.v == ":") then
+				continue
+			end
+			if prev and prev.t == "name" and prev.v == "local" then
+				continue
+			end
+			if not (nextTok and nextTok.t == "sym" and nextTok.v == "=") then
+				continue
+			end
+
+			first[tok.v] = { i + 2, expressionRange(tokens, n, i + 2) }
+		end
+
+		return first
+	end
+
+	local function looksBoolean(tokens, from, to)
+		for i = from, to do
+			local tok = tokens[i]
+			if tok.t == "sym" and BOOLEAN_OPERATORS[tok.v] then
+				return true
+			end
+			if tok.t == "name" and (tok.v == "true" or tok.v == "false" or tok.v == "not") then
+				return true
+			end
+		end
+		return false
+	end
+
 	--- `v7` -> `HouseDB`, by looking at what v7 was declared as. nil if it stays nameless.
 	local function resolvePlaceholder(tokens, name, ctx, depth)
 		if not isPlaceholderName(name) then
@@ -4526,7 +4636,7 @@ do
 
 		local generic = {}
 		for slot = 1, count do
-			generic[slot] = "arg" .. slot
+			generic[slot] = "param" .. slot
 		end
 		return generic
 	end
@@ -4537,7 +4647,7 @@ do
 
 		for i = 1, n do
 			local tok = tokens[i]
-			if tok.t ~= "name" or tok.v ~= "function" then
+			if tok.t ~= "name" or tok.v ~= "function" or isTypeAnnotationFunction(tokens, i) then
 				continue
 			end
 
@@ -4756,11 +4866,19 @@ do
 		end
 
 		local function pick(base, separator)
-			local candidate, suffix = base, 1
-			while used[candidate] or active[candidate] do
-				suffix += 1
-				candidate = base .. separator .. suffix
+			if not used[base] and not active[base] and not isPlaceholderName(base) then
+				return base
 			end
+
+			-- ? `v` -> `v2` would read exactly like a decompiler name, so widen to a word first
+			local word = SINGLE_LETTER_WORDS[base] or base
+			local candidate, suffix = word, 1
+
+			while used[candidate] or active[candidate] or isPlaceholderName(candidate) do
+				suffix += 1
+				candidate = word .. separator .. suffix
+			end
+
 			return candidate
 		end
 
@@ -4836,7 +4954,82 @@ do
 					not nameTok or nameTok.t ~= "name" or KEYWORDS[nameTok.v]
 					or not eqTok or eqTok.t ~= "sym" or eqTok.v ~= "="
 				then
-					continue -- ? Multi-name declarations and `local function` are left alone
+					-- ? `local x`, `local a, b = ...`, `local function f` -- no single value to read
+					if aggressive then
+						local j = i + 1
+						local isFunc = tokens[j] ~= nil and tokens[j].v == "function"
+						if isFunc then
+							j += 1
+						end
+
+						local names, nameCount = {}, 0
+						while tokens[j] do
+							local cur = tokens[j]
+							if cur.t == "name" and not KEYWORDS[cur.v] then
+								nameCount += 1
+								names[nameCount] = cur.v
+							elseif not (cur.t == "sym" and cur.v == ",") then
+								break
+							end
+							j += 1
+						end
+
+						local rhsFrom, rhsTo
+						if not isFunc and tokens[j] and tokens[j].t == "sym" and tokens[j].v == "=" then
+							local stop = expressionRange(tokens, n, j + 1)
+							if stop >= j + 1 then
+								rhsFrom, rhsTo = j + 1, stop
+							end
+						end
+
+						for slot = 1, nameCount do
+							local nm = names[slot]
+							if renames[nm] or inlines[nm] or declaredCount[nm] ~= 1 then
+								continue
+							end
+							if not isPlaceholderName(nm) then
+								continue
+							end
+
+							local ctx = {
+								name = nm,
+								declarations = sources.declarations,
+								assignments = sources.assignments,
+								loops = sources.loops,
+								firstAssignments = sources.firstAssignments,
+							}
+
+							local base
+							if isFunc then
+								base = "fn"
+							elseif rhsFrom then
+								base = suggestFromExpression(tokens, rhsFrom, rhsTo)
+									or fallbackName(tokens, rhsFrom, rhsTo, ctx)
+							else
+								-- ? `local v8;` filled in later -- read the first thing assigned to it
+								local target = sources.firstAssignments[nm]
+								if target and looksBoolean(tokens, target[1], target[2]) then
+									base = "condition"
+								elseif target then
+									base = suggestFromExpression(tokens, target[1], target[2])
+										or fallbackName(tokens, target[1], target[2], ctx)
+								else
+									base = "value"
+								end
+							end
+
+							base = sanitizeIdentifier(base)
+							if not base or isPlaceholderName(base) then
+								base = "value"
+							end
+
+							local chosen = pick(base, "_")
+							renames[nm] = chosen
+							bind(chosen)
+						end
+					end
+
+					continue
 				end
 
 				local name = nameTok.v
@@ -4889,6 +5082,10 @@ do
 					bind(chosen)
 				end
 			elseif v == "function" then
+				if isTypeAnnotationFunction(tokens, i) then
+					continue -- ? A type annotation opens no block
+				end
+
 				local wanted
 				local p1, p2, p3, p4 = tokens[i - 1], tokens[i - 2], tokens[i - 3], tokens[i - 4]
 				if
@@ -5087,6 +5284,12 @@ do
 		end
 
 		local declared, declaredCount, assigned = collectBindings(tokens, n)
+
+		if normalizeUpvalueMarkers(tokens, n, declaredCount) > 0 then
+			changed = true
+			declared, declaredCount, assigned = collectBindings(tokens, n)
+		end
+
 		local drops = {}
 
 		if opts.Rename then
@@ -5111,6 +5314,7 @@ do
 				declarations = declarations,
 				assignments = assignmentSources(tokens, n),
 				loops = loopCollections(tokens, n, declarations),
+				firstAssignments = firstAssignments(tokens, n),
 			}
 
 			local renames, inlines, tokenRenames
