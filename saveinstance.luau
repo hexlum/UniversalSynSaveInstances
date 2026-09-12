@@ -3844,6 +3844,28 @@ do
 		return name
 	end
 
+	--- `p: function` is not legal Luau -- the parser rejects the keyword outright, which is why
+	--- Studio reports "Using 'function' as a type annotation is not supported". Decompilers emit it
+	--- anyway, so rewrite it to the form Luau accepts. The token is retyped so nothing downstream
+	--- mistakes it for a function definition.
+	local function fixFunctionTypeAnnotations(tokens, n)
+		local changed = 0
+
+		for i = 1, n do
+			local tok = tokens[i]
+			if tok.t ~= "name" or tok.v ~= "function" or not isTypeAnnotationFunction(tokens, i) then
+				continue
+			end
+
+			-- ? Always parenthesised: a bare `(...any) -> ...any` binds wrong inside a union or before `?`
+			tok.v = "((...any) -> ...any)"
+			tok.t = "type"
+			changed += 1
+		end
+
+		return changed
+	end
+
 	-- ? Konstant marks upvalue reads and writes by suffixing the name: `load_upvr`, `v3_upvw`, `Config_upvr_2`
 	local function stripUpvalueSuffix(name)
 		local base = match(name, "^(.+)_upv[rw]?$") or match(name, "^(.+)_upv[rw]?_%d+$")
@@ -5281,6 +5303,10 @@ do
 				tail = filteredTail
 				changed = true
 			end
+		end
+
+		if fixFunctionTypeAnnotations(tokens, n) > 0 then
+			changed = true
 		end
 
 		local declared, declaredCount, assigned = collectBindings(tokens, n)
