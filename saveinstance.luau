@@ -164,12 +164,6 @@ pcall(function()
 	makefolder(USSI_FOLDER)
 end)
 
-local REFLECTION_FILTER = {
-	Security = SecurityCapabilities.new(unpack(Enum.SecurityCapability:GetEnumItems())),
-	ExcludeDisplay = true,
-	ExcludeInherited = true,
-}
-
 local Type_Ids = {
 	["string"] = 1,
 	["bool"] = 2,
@@ -3071,6 +3065,9 @@ do
 
 		local API_Dump
 
+		local Max_SecurityCapabilities = SecurityCapabilities.new(unpack(Enum.SecurityCapability:GetEnumItems()))
+		local filter = { Security = Max_SecurityCapabilities, ExcludeDisplay = true, ExcludeInherited = true }
+
 		-- ! exact version match is preferred, mismatched dump versions might result in saveinstance trying to save properties that your client doesn't have yet
 		local APIDUMP_FETCHERS = {
 			[1] = function()
@@ -3219,7 +3216,7 @@ do
 					Region3Int16 = "Region3int16",
 				}
 
-				for _, api_class in service.ReflectionService:GetClasses(REFLECTION_FILTER) do
+				for _, api_class in service.ReflectionService:GetClasses(filter) do
 					local members, members_size = {}, 1
 					local className = api_class.Name
 
@@ -3247,7 +3244,7 @@ do
 						service.ReflectionService.GetPropertiesOfClass,
 						service.ReflectionService,
 						className,
-						REFLECTION_FILTER
+						filter
 					) -- ? Might produce errors (ex. RolloutValidation) therefore pcall
 					if o then
 						for _, property in r do
@@ -3410,7 +3407,7 @@ do
 										service.ReflectionService.GetPropertiesOfClass,
 										service.ReflectionService,
 										ClassName,
-										REFLECTION_FILTER
+										filter
 									)
 									if o then
 										for _, property in properties do
@@ -3544,6 +3541,1615 @@ do
 	end
 end
 
+-- ? Decompiler output cleanup.
+-- ? Decompilers emit placeholder names (u1, v3, l_Foo_2, ...) because Luau bytecode does not keep local variable names.
+-- ? This pass recovers readable names wherever the code itself says what a value is, folds global aliases back in,
+-- ? drops the banner comments decompilers sign their output with, and optionally strips print calls.
+-- ? It rewrites a token stream rather than text, so strings and real code are never touched.
+local cleanDecompiledSource
+do
+	local rep, sub, find, match, gsub, lower =
+		string.rep, string.sub, string.find, string.match, string.gsub, string.lower
+
+	local KEYWORDS = arrayToDict({
+		"and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in",
+		"local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while", "continue",
+	})
+
+	-- ? Globals safe to substitute back in place of a local alias (stateless, never expected to be rebound)
+	local INLINEABLE_GLOBALS = arrayToDict({
+		"print", "warn", "game", "workspace", "script", "shared",
+		"string", "table", "math", "os", "task", "coroutine", "debug", "bit32", "utf8", "buffer",
+		"pairs", "ipairs", "next", "select", "type", "typeof", "tostring", "tonumber", "unpack",
+		"rawget", "rawset", "rawequal", "rawlen", "setmetatable", "getmetatable",
+		"assert", "error", "pcall", "xpcall", "require", "loadstring", "newproxy",
+		"wait", "spawn", "delay", "tick", "time", "elapsedTime", "collectgarbage", "gcinfo",
+		"Instance", "Enum", "Vector2", "Vector3", "Vector2int16", "Vector3int16", "CFrame",
+		"Color3", "BrickColor", "UDim", "UDim2", "Ray", "Rect", "Region3", "Random", "TweenInfo",
+		"NumberRange", "NumberSequence", "ColorSequence", "NumberSequenceKeypoint", "ColorSequenceKeypoint",
+		"PhysicalProperties", "Faces", "Axes", "Font", "DateTime", "OverlapParams", "RaycastParams",
+	})
+
+	-- ? Methods whose string argument names the value being stored
+	local NAMING_METHODS = arrayToDict({
+		"GetService", "WaitForChild", "FindFirstChild", "FindFirstChildOfClass",
+		"WaitForChildOfClass", "FindFirstChildWhichIsA", "FindFirstAncestor",
+	})
+
+	-- ? Fields that would make a worse variable name than the placeholder does
+	local BAD_FIELD_NAMES = arrayToDict({ "Parent", "Name", "new", "Value", "self" })
+
+	local CONNECT_METHODS = arrayToDict({ "Connect", "connect", "Once", "ConnectParallel" })
+
+	-- ? Roblox events whose handler parameters have one obvious name each
+	local EVENT_PARAMS = {
+		Touched = { "hit" },
+		TouchEnded = { "hit" },
+		CharacterAdded = { "character" },
+		CharacterRemoving = { "character" },
+		CharacterAppearanceLoaded = { "character" },
+		PlayerAdded = { "player" },
+		PlayerRemoving = { "player" },
+		ChildAdded = { "child" },
+		ChildRemoved = { "child" },
+		DescendantAdded = { "descendant" },
+		DescendantRemoving = { "descendant" },
+		InputBegan = { "input", "gameProcessed" },
+		InputChanged = { "input", "gameProcessed" },
+		InputEnded = { "input", "gameProcessed" },
+		RenderStepped = { "deltaTime" },
+		Heartbeat = { "deltaTime" },
+		PreRender = { "deltaTime" },
+		PreSimulation = { "deltaTime" },
+		PostSimulation = { "deltaTime" },
+		Stepped = { "elapsed", "deltaTime" },
+		Changed = { "property" },
+		AncestryChanged = { "child", "parent" },
+		Chatted = { "message" },
+		Equipped = { "mouse" },
+		PromptTriggered = { "prompt", "player" },
+		PromptButtonHoldBegan = { "prompt", "player" },
+	}
+
+	-- ? Luau bytecode does not store comments, so every comment in decompiled output was written by the
+	-- ? decompiler: banners, "-- upvalues: ...", "-- line: 14". All of it goes, except anything warning
+	-- ? that the decompilation itself is incomplete -- deleting that would hide a real problem.
+	local KEEP_COMMENT_SUBSTRINGS =
+		{ "warning", "error", "fail", "could not", "unable", "unsupported", "unhandled", "incomplete" }
+
+	-- ? Verbs a call name wears in front of the thing it actually returns
+	local CALL_PREFIXES_SNAKE = { "get_", "create_", "make_", "new_", "fetch_", "build_" }
+	local CALL_PREFIXES_CAMEL = { "get", "create", "make", "new", "fetch", "build" }
+
+	-- ? `set_volume(p1)` is telling us p1 is the volume
+	local SETTER_PREFIXES = { "set_", "update_", "apply_", "handle_", "on_" }
+	local PARAM_KEY_PREFIXES = { "dynamic_", "get_", "set_", "on_", "handle_", "do_" }
+	local TABLE_SUFFIXES = { "DB", "Db", "Data", "Table", "Map", "List", "Cache", "Registry" }
+	local ITERATORS = arrayToDict({ "pairs", "ipairs", "next" })
+
+	-- ? A `print` is a statement only if the token before it can legally end one
+	local STMT_PREV_SYMBOLS = arrayToDict({ ";", ")", "]", "}" })
+	local STMT_PREV_KEYWORD_BLOCK =
+		arrayToDict({ "function", "local", "return", "and", "or", "not", "in", "if", "elseif", "while", "until", "for" })
+
+	local COMPOUND_ASSIGN = arrayToDict({ "=", "+=", "-=", "*=", "/=", "%=", "^=", "..=", "//=" })
+	local OPENERS = arrayToDict({ "(", "{", "[" })
+	local CLOSERS = arrayToDict({ ")", "}", "]" })
+
+	local MARK = string.char(1) -- ? Stands in for a removed comment until we know whether its line is now empty
+	local MARK_LINE = "[ \t]*" .. MARK .. "[ \t" .. MARK .. "]*"
+
+	local function readLongBracket(src, i)
+		local j, level = i + 1, 0
+		while sub(src, j, j) == "=" do
+			level += 1
+			j += 1
+		end
+		if sub(src, j, j) ~= "[" then
+			return nil
+		end
+		local _, close = find(src, "]" .. rep("=", level) .. "]", j + 1, true)
+		return close and close + 1 or #src + 1
+	end
+
+	--- Splits source into tokens, each carrying the whitespace and comments that preceded it.
+	local function tokenize(src)
+		local tokens, n = {}, 0
+		local i, len, wsStart = 1, #src, 1
+
+		while i <= len do
+			local c = sub(src, i, i)
+
+			if c == " " or c == "\t" or c == "\n" or c == "\r" then
+				i += 1
+			elseif c == "-" and sub(src, i + 1, i + 1) == "-" then
+				local j = i + 2
+				local long = sub(src, j, j) == "[" and readLongBracket(src, j)
+				if long then
+					i = long
+				else
+					local nl = find(src, "\n", j, true)
+					i = nl or len + 1
+				end
+			else
+				local ws, startI, tt = sub(src, wsStart, i - 1), i, nil
+
+				if c == '"' or c == "'" then
+					tt = "str"
+					local j = i + 1
+					while j <= len do
+						local ch = sub(src, j, j)
+						if ch == "\\" then
+							j += 2
+						elseif ch == c or ch == "\n" then
+							j += 1
+							break
+						else
+							j += 1
+						end
+					end
+					i = j
+				elseif c == "[" and (sub(src, i + 1, i + 1) == "[" or sub(src, i + 1, i + 1) == "=") then
+					local close = readLongBracket(src, i)
+					tt = close and "str" or "sym"
+					i = close or i + 1
+				elseif find(c, "^[%a_]") then
+					tt = "name"
+					local _, e = find(src, "^[%w_]+", i)
+					i = e + 1
+				elseif find(c, "^%d") or c == "." and find(sub(src, i + 1, i + 1), "^%d") then
+					tt = "num"
+					local _, e = find(src, "^0[xX][%x_]+", i)
+					if not e then
+						_, e = find(src, "^[%d_]*%.?[%d_]*", i)
+						local _, exponent = find(src, "^[eE][%+%-]?%d+", e + 1)
+						e = exponent or e
+					end
+					i = e + 1
+				else
+					tt = "sym"
+					local three, two = sub(src, i, i + 2), sub(src, i, i + 1)
+					if three == "..." or three == "..=" or three == "//=" then
+						i += 3
+					elseif
+						two == "==" or two == "~=" or two == "<=" or two == ">=" or two == ".."
+						or two == "::" or two == "->" or two == "//"
+						or two == "+=" or two == "-=" or two == "*=" or two == "/=" or two == "%=" or two == "^="
+					then
+						i += 2
+					else
+						i += 1
+					end
+				end
+
+				n += 1
+				tokens[n] = { t = tt, v = sub(src, startI, i - 1), ws = ws }
+				wsStart = i
+			end
+		end
+
+		return tokens, n, sub(src, wsStart)
+	end
+
+	local function isNoiseComment(text)
+		local lowered = lower(text)
+		for _, needle in KEEP_COMMENT_SUBSTRINGS do
+			if find(lowered, needle, 1, true) then
+				return false
+			end
+		end
+		return true
+	end
+
+	--- Drops decompiler comments, and the line they sat on, from one run of trivia.
+	--- @param atLineStart boolean? -- Whether this run begins a line; only then may a banner at its very start take a newline with it
+	local function filterTrivia(ws, atLineStart)
+		if not find(ws, "--", 1, true) or find(ws, MARK, 1, true) then
+			return ws
+		end
+
+		local pieces, count = {}, 0
+		local i, len, plainStart, found = 1, #ws, 1, false
+
+		while i <= len do
+			if sub(ws, i, i) == "-" and sub(ws, i + 1, i + 1) == "-" then
+				if i > plainStart then
+					count += 1
+					pieces[count] = sub(ws, plainStart, i - 1)
+				end
+
+				local j = i + 2
+				local stop = sub(ws, j, j) == "[" and readLongBracket(ws, j)
+				if not stop then
+					stop = find(ws, "\n", j, true) or len + 1
+				end
+
+				local text = sub(ws, i, stop - 1)
+				count += 1
+				if isNoiseComment(text) then
+					pieces[count] = MARK
+					found = true
+				else
+					pieces[count] = text
+				end
+
+				i = stop
+				plainStart = stop
+			else
+				i += 1
+			end
+		end
+
+		if len >= plainStart then
+			count += 1
+			pieces[count] = sub(ws, plainStart, len)
+		end
+
+		if not found then
+			return ws
+		end
+
+		local marked = table.concat(pieces)
+		local collapsing = true
+
+		while collapsing do
+			local c1, c2, c3 = 0, 0, 0
+			if atLineStart then
+				marked, c1 = gsub(marked, "^" .. MARK_LINE .. "\n", "")
+			end
+			marked, c2 = gsub(marked, "(\n)" .. MARK_LINE .. "\n", "%1")
+			marked, c3 = gsub(marked, "(\n)" .. MARK_LINE .. "$", "%1")
+			collapsing = c1 + c2 + c3 > 0
+		end
+
+		if atLineStart then
+			marked = gsub(marked, "^" .. MARK_LINE .. "$", "")
+		end
+
+		marked = gsub(marked, MARK, "")
+
+		return (gsub(marked, "[ \t]+\n", "\n"))
+	end
+
+	local function stringValue(token)
+		local v = token.v
+		return match(v, "^%[=*%[(.*)%]=*%]$") or sub(v, 2, -2)
+	end
+
+	local function sanitizeIdentifier(name)
+		if not name or name == "" then
+			return nil
+		end
+		name = gsub(name, "[^%w_]", "_")
+		if find(name, "^%d") then
+			name = "_" .. name
+		end
+		if KEYWORDS[name] or not find(name, "^[%a_][%w_]*$") then
+			return nil
+		end
+		return name
+	end
+
+	-- ? Only touch names a decompiler generated -- anything else came from real debug info and already means something
+	local function isPlaceholderName(name)
+		return (
+			match(name, "^[uvpas]%d+$")
+			or match(name, "^[uv]_u_%d+$")
+			or match(name, "^a_u_%d+$")
+			or match(name, "^var_?%d+$")
+			or match(name, "^arg%d+$")
+			or match(name, "^l_[%w_]-_%d+$")
+		) ~= nil
+	end
+
+	-- ? Some decompilers keep the original name buried inside the placeholder, as in `l_StarterGui_1`
+	local function embeddedName(name)
+		return match(name, "^l_(.+)_%d+$")
+	end
+
+	--- `create_log` -> `log`, `getState` -> `state`, `can_edit_house` -> itself, `download` -> nothing.
+	local function descriptiveCallName(name)
+		for _, prefix in CALL_PREFIXES_SNAKE do
+			if #name > #prefix and sub(name, 1, #prefix) == prefix then
+				return sub(name, #prefix + 1)
+			end
+		end
+
+		for _, prefix in CALL_PREFIXES_CAMEL do
+			if #name > #prefix and sub(name, 1, #prefix) == prefix then
+				local rest = sub(name, #prefix + 1)
+				if find(rest, "^%u") then
+					return lower(sub(rest, 1, 1)) .. sub(rest, 2)
+				end
+			end
+		end
+
+		local core = match(name, "^_*(.-)_*$")
+		if core and find(core, "_", 1, true) then
+			return name -- ? A multi-word snake_case name already describes its result
+		end
+
+		return nil
+	end
+
+	--- Walks back from a `)` to its `(`.
+	local function matchingOpen(tokens, closeAt, floor)
+		local depth, j = 0, closeAt
+
+		while j >= floor do
+			local cur = tokens[j]
+			if cur.t == "sym" then
+				if CLOSERS[cur.v] then
+					depth += 1
+				elseif OPENERS[cur.v] then
+					depth -= 1
+					if depth == 0 then
+						return j
+					end
+				end
+			end
+			j -= 1
+		end
+
+		return nil
+	end
+
+	--- Walks the right hand side of an assignment and returns the name the value most obviously deserves.
+	local function suggestFromExpression(tokens, from, to)
+		-- ? `require(a.b.Thing)` is named by what is inside the call, so look there first
+		local firstTok, secondTok = tokens[from], tokens[from + 1]
+		if
+			firstTok and firstTok.t == "name" and firstTok.v == "require"
+			and secondTok and secondTok.t == "sym" and secondTok.v == "("
+		then
+			local depth, j = 0, from + 1
+			while j <= to do
+				local cur = tokens[j]
+				if cur.t == "sym" then
+					if OPENERS[cur.v] then
+						depth += 1
+					elseif CLOSERS[cur.v] then
+						depth -= 1
+						if depth == 0 then
+							break
+						end
+					end
+				end
+				j += 1
+			end
+
+			if j - 1 > from + 2 then
+				local inner = suggestFromExpression(tokens, from + 2, j - 1)
+				if inner then
+					return inner
+				end
+			end
+		end
+
+		local best
+		local depth, i = 0, from
+
+		while i <= to do
+			local tok = tokens[i]
+
+			if tok.t == "sym" then
+				if OPENERS[tok.v] then
+					depth += 1
+				elseif CLOSERS[tok.v] then
+					depth -= 1
+				elseif depth == 0 and (tok.v == "." or tok.v == ":") then
+					-- ? Only at depth 0: inside brackets we would be naming an argument, not the value
+					local nameTok, afterTok = tokens[i + 1], tokens[i + 2]
+					if nameTok and nameTok.t == "name" and not KEYWORDS[nameTok.v] then
+						if afterTok and afterTok.t == "sym" and afterTok.v == "(" then
+							local argTok = tokens[i + 3]
+							if NAMING_METHODS[nameTok.v] and argTok and argTok.t == "str" then
+								best = stringValue(argTok)
+							end
+						elseif not BAD_FIELD_NAMES[nameTok.v] then
+							best = nameTok.v
+						end
+					end
+				end
+			elseif tok.t == "name" and tok.v == "Instance" and depth == 0 then
+				local dotTok, newTok, openTok, argTok = tokens[i + 1], tokens[i + 2], tokens[i + 3], tokens[i + 4]
+				if
+					dotTok and dotTok.v == "." and newTok and newTok.v == "new"
+					and openTok and openTok.v == "(" and argTok and argTok.t == "str"
+				then
+					best = stringValue(argTok)
+				end
+			end
+
+			i += 1
+		end
+
+		-- ? The outermost call is the operation that produced the value, so it gets the last word
+		local lastTok = tokens[to]
+		if lastTok and lastTok.t == "sym" and lastTok.v == ")" then
+			local open = matchingOpen(tokens, to, from)
+			local fnTok = open and tokens[open - 1]
+
+			if fnTok and fnTok.t == "name" and not KEYWORDS[fnTok.v] and not NAMING_METHODS[fnTok.v] then
+				local described = descriptiveCallName(fnTok.v)
+				if described then
+					return sanitizeIdentifier(described)
+				end
+
+				if best == nil then
+					-- ? `load("TerrainHelper")`, `load("package:Sift")` -- the one string argument names it
+					local arg, afterArg = tokens[open + 1], tokens[open + 2]
+					if arg and arg.t == "str" and afterArg and afterArg.t == "sym" and afterArg.v == ")" then
+						local segment = match(stringValue(arg), "([^:/%.]*)$")
+						if segment and #segment >= 2 and find(segment, "^[%a_][%w_]*$") then
+							return sanitizeIdentifier(segment)
+						end
+					end
+				end
+			end
+		end
+
+		return sanitizeIdentifier(best)
+	end
+
+	--- Returns the last token of a single line assignment right hand side, following any bracketed continuation.
+	local function expressionRange(tokens, n, from)
+		local depth, i = 0, from
+
+		while i <= n do
+			local tok = tokens[i]
+
+			if tok.t == "sym" then
+				if OPENERS[tok.v] then
+					depth += 1
+				elseif CLOSERS[tok.v] then
+					depth -= 1
+					if depth < 0 then
+						break
+					end
+				elseif tok.v == ";" and depth == 0 then
+					break
+				end
+			end
+
+			if depth == 0 and i > from and find(tok.ws, "\n", 1, true) then
+				break
+			end
+
+			i += 1
+		end
+
+		return i - 1
+	end
+
+	--- Returns the parameter names of the `function` token at `at`.
+	local function functionParams(tokens, at)
+		local open, limit = at + 1, at + 12
+		while open <= limit and tokens[open] and not (tokens[open].t == "sym" and tokens[open].v == "(") do
+			open += 1
+		end
+
+		local openTok = tokens[open]
+		if not openTok or openTok.t ~= "sym" or openTok.v ~= "(" then
+			return nil, 0
+		end
+
+		local params, count = {}, 0
+		local j, depth, expectName = open + 1, 0, true
+
+		while tokens[j] do
+			local cur = tokens[j]
+			if cur.t == "sym" then
+				if OPENERS[cur.v] then
+					depth += 1
+				elseif CLOSERS[cur.v] then
+					if depth == 0 then
+						break
+					end
+					depth -= 1
+				elseif cur.v == "," and depth == 0 then
+					expectName = true
+				end
+			elseif cur.t == "name" and expectName and not KEYWORDS[cur.v] then
+				count += 1
+				params[count] = cur.v
+				expectName = false
+			end
+			j += 1
+		end
+
+		return params, count
+	end
+
+	--- Collects every name a statement introduces plus every name written to afterwards, so we know what is safe to rewrite.
+	local function collectBindings(tokens, n)
+		local declared, declaredCount, assigned, declarationAt = {}, {}, {}, {}
+
+		local function declare(at, name)
+			declarationAt[at] = true
+			declared[name] = true
+			declaredCount[name] = (declaredCount[name] or 0) + 1
+		end
+
+		for i = 1, n do
+			local tok = tokens[i]
+			if tok.t ~= "name" then
+				continue
+			end
+
+			if tok.v == "local" then
+				local j = i + 1
+				if tokens[j] and tokens[j].v == "function" then
+					j += 1
+				end
+				while tokens[j] do
+					local cur = tokens[j]
+					if cur.t == "name" and not KEYWORDS[cur.v] then
+						declare(j, cur.v)
+					elseif not (cur.t == "sym" and cur.v == ",") then
+						break
+					end
+					j += 1
+				end
+			elseif tok.v == "function" then
+				local j = i + 1
+				while tokens[j] and not (tokens[j].t == "sym" and tokens[j].v == "(") do
+					j += 1
+				end
+				j += 1
+				while tokens[j] and not (tokens[j].t == "sym" and tokens[j].v == ")") do
+					local cur = tokens[j]
+					if cur.t == "name" and not KEYWORDS[cur.v] then
+						declare(j, cur.v)
+					end
+					j += 1
+				end
+			elseif tok.v == "for" then
+				local j = i + 1
+				while tokens[j] do
+					local cur = tokens[j]
+					if cur.t == "name" and not KEYWORDS[cur.v] then
+						declare(j, cur.v)
+					elseif not (cur.t == "sym" and cur.v == ",") then
+						break
+					end
+					j += 1
+				end
+			end
+		end
+
+		for i = 1, n do
+			local tok = tokens[i]
+			if tok.t ~= "name" or KEYWORDS[tok.v] or declarationAt[i] then
+				continue -- ? A declaration is not a reassignment
+			end
+
+			local prev = tokens[i - 1]
+			if prev and prev.t == "sym" and (prev.v == "." or prev.v == ":") then
+				continue -- ? `t.print = x` writes a field, not the global
+			end
+
+			local nextTok = tokens[i + 1]
+			if nextTok and nextTok.t == "sym" and COMPOUND_ASSIGN[nextTok.v] then
+				assigned[tok.v] = true
+			end
+		end
+
+		return declared, declaredCount, assigned
+	end
+
+	local function singularize(name)
+		if #name < 4 then
+			return name
+		end
+
+		local lowered = lower(name)
+		if sub(lowered, -3) == "ies" then
+			return sub(name, 1, -4) .. "y"
+		end
+
+		local tail4 = sub(lowered, -4)
+		if tail4 == "ches" or tail4 == "shes" or tail4 == "sses" then
+			return sub(name, 1, -3)
+		end
+
+		local tail3 = sub(lowered, -3)
+		if tail3 == "xes" or tail3 == "zes" or tail3 == "ses" then
+			return sub(name, 1, -3)
+		end
+
+		if sub(lowered, -1) == "s" and sub(lowered, -2) ~= "ss" then
+			return sub(name, 1, -2)
+		end
+
+		return name
+	end
+
+	local function stripTableSuffix(name)
+		for _, suffix in TABLE_SUFFIXES do
+			if #name > #suffix and sub(name, -#suffix) == suffix then
+				return sub(name, 1, -(#suffix + 1))
+			end
+		end
+		return name
+	end
+
+	--- name -> right hand side range of its `local name = ...`.
+	local function declarationSources(tokens, n)
+		local sources = {}
+
+		for i = 1, n do
+			local tok = tokens[i]
+			if tok.t ~= "name" or tok.v ~= "local" then
+				continue
+			end
+
+			local nameTok, eqTok = tokens[i + 1], tokens[i + 2]
+			if not nameTok or nameTok.t ~= "name" or not eqTok or eqTok.v ~= "=" then
+				continue
+			end
+
+			local last = expressionRange(tokens, n, i + 3)
+			if last >= i + 3 then
+				sources[nameTok.v] = { i + 3, last }
+			end
+		end
+
+		return sources
+	end
+
+	--- name -> right hand side range, but only when the name is written to exactly once.
+	local function assignmentSources(tokens, n)
+		local counts, ranges = {}, {}
+
+		for i = 1, n do
+			local tok = tokens[i]
+			if tok.t ~= "name" or KEYWORDS[tok.v] then
+				continue
+			end
+
+			local prev, nextTok = tokens[i - 1], tokens[i + 1]
+			if prev and prev.t == "sym" and (prev.v == "." or prev.v == ":") then
+				continue
+			end
+			if prev and prev.t == "name" and prev.v == "local" then
+				continue
+			end
+			if not (nextTok and nextTok.t == "sym" and nextTok.v == "=") then
+				continue
+			end
+
+			counts[tok.v] = (counts[tok.v] or 0) + 1
+			ranges[tok.v] = { i + 2, expressionRange(tokens, n, i + 2) }
+		end
+
+		local single = {}
+		for name, range in ranges do
+			if counts[name] == 1 then
+				single[name] = range
+			end
+		end
+
+		return single
+	end
+
+	--- loop variable -> singular of what it iterates, when that variable is a loop variable only once.
+	local function loopCollections(tokens, n, declarations)
+		local hits, seen = {}, {}
+
+		for i = 1, n do
+			local tok = tokens[i]
+			if tok.t ~= "name" or tok.v ~= "for" then
+				continue
+			end
+
+			local vars, varCount, generic, j = {}, 0, false, i + 1
+			while tokens[j] do
+				local cur = tokens[j]
+				if cur.t == "name" and not KEYWORDS[cur.v] then
+					varCount += 1
+					vars[varCount] = cur.v
+				elseif cur.t == "name" and cur.v == "in" then
+					generic = true
+					break
+				elseif not (cur.t == "sym" and cur.v == ",") then
+					break
+				end
+				j += 1
+			end
+
+			if not generic then
+				continue
+			end
+
+			local start = j + 1
+			local depth, k = 0, start
+			while tokens[k] do
+				local cur = tokens[k]
+				if cur.t == "sym" then
+					if OPENERS[cur.v] then
+						depth += 1
+					elseif CLOSERS[cur.v] then
+						depth -= 1
+					end
+				elseif cur.t == "name" and cur.v == "do" and depth == 0 then
+					break
+				end
+				k += 1
+			end
+
+			local a, b = start, k - 1
+
+			-- ? Unwrap pairs(x) / ipairs(x) / next(x)
+			local head = tokens[a]
+			if
+				head and head.t == "name" and ITERATORS[head.v]
+				and tokens[a + 1] and tokens[a + 1].v == "("
+				and tokens[b] and tokens[b].v == ")"
+			then
+				a, b = a + 2, b - 1
+			end
+
+			if b < a then
+				continue
+			end
+
+			local source
+			if a == b and tokens[a].t == "name" then
+				source = tokens[a].v
+				if isPlaceholderName(source) then
+					-- ? `for _, v in pairs(v17)` -- v17 has a real name of its own, look it up
+					local nested = declarations[source]
+					source = nested and suggestFromExpression(tokens, nested[1], nested[2]) or nil
+				end
+			else
+				source = suggestFromExpression(tokens, a, b)
+			end
+
+			if not source or isPlaceholderName(source) then
+				continue
+			end
+
+			local singular = sanitizeIdentifier(singularize(source))
+			if not singular then
+				continue
+			end
+
+			for _, name in vars do
+				seen[name] = (seen[name] or 0) + 1
+				hits[name] = singular
+			end
+		end
+
+		local unambiguous = {}
+		for name, singular in hits do
+			if seen[name] == 1 then
+				unambiguous[name] = singular
+			end
+		end
+
+		return unambiguous
+	end
+
+	local fallbackName
+
+	--- `v7` -> `HouseDB`, by looking at what v7 was declared as. nil if it stays nameless.
+	local function resolvePlaceholder(tokens, name, ctx, depth)
+		if not isPlaceholderName(name) then
+			return name
+		end
+		if depth > 2 then
+			return nil
+		end
+
+		local source = ctx.declarations[name]
+		if not source then
+			return nil
+		end
+
+		local inner = {
+			name = name,
+			declarations = ctx.declarations,
+			assignments = ctx.assignments,
+			loops = ctx.loops,
+		}
+
+		return suggestFromExpression(tokens, source[1], source[2])
+			or fallbackName(tokens, source[1], source[2], inner, depth + 1)
+	end
+
+	--- A readable name for a value the precise rules could not name. Never returns nil.
+	function fallbackName(tokens, from, to, ctx, depth)
+		depth = depth or 0
+		if to < from or depth > 2 then
+			return "value"
+		end
+
+		-- ? `x or {}` -- the interesting half is on the left
+		local level, i, split = 0, from, nil
+		while i <= to do
+			local cur = tokens[i]
+			if cur.t == "sym" then
+				if OPENERS[cur.v] then
+					level += 1
+				elseif CLOSERS[cur.v] then
+					level -= 1
+				end
+			elseif cur.t == "name" and cur.v == "or" and level == 0 then
+				split = i
+				break
+			end
+			i += 1
+		end
+
+		if split and split > from then
+			return fallbackName(tokens, from, split - 1, ctx, depth + 1)
+		end
+
+		local head, last = tokens[from], tokens[to]
+
+		-- ? A bare `nil` -- look at what gets assigned to it later
+		if from == to and head.t == "name" and head.v == "nil" then
+			local target = ctx.assignments[ctx.name]
+			if target then
+				local a, b = target[1], target[2]
+				if b == a and tokens[a].t == "name" then
+					local referenced = tokens[a].v
+					if ctx.loops[referenced] then
+						return ctx.loops[referenced]
+					end
+					local nested = ctx.declarations[referenced]
+					if nested and depth < 2 then
+						local inner = suggestFromExpression(tokens, nested[1], nested[2])
+						return inner or fallbackName(tokens, nested[1], nested[2], ctx, depth + 1)
+					end
+				end
+				return suggestFromExpression(tokens, a, b) or fallbackName(tokens, a, b, ctx, depth + 1)
+			end
+			return "value"
+		end
+
+		-- ? A single name -- borrow whatever that name is
+		if from == to and head.t == "name" then
+			if ctx.loops[head.v] then
+				return ctx.loops[head.v]
+			end
+			if KEYWORDS[head.v] then
+				return "value"
+			end
+			return resolvePlaceholder(tokens, head.v, ctx, depth + 1) or "value"
+		end
+
+		if last.t == "sym" and last.v == "]" then
+			local open
+			local bracketLevel, k = 0, to
+			while k >= from do
+				local cur = tokens[k]
+				if cur.t == "sym" then
+					if cur.v == "]" then
+						bracketLevel += 1
+					elseif cur.v == "[" then
+						bracketLevel -= 1
+						if bracketLevel == 0 then
+							open = k
+							break
+						end
+					end
+				end
+				k -= 1
+			end
+
+			if open then
+				local before, key = tokens[open - 1], tokens[open + 1]
+
+				if before and before.t == "sym" and before.v == ")" then
+					local callOpen = matchingOpen(tokens, open - 1, from)
+					local fnTok = callOpen and tokens[callOpen - 1]
+					if fnTok and fnTok.v == "GetChildren" then
+						if key and key.t == "num" and key.v == "1" then
+							return "firstChild"
+						end
+						return "child"
+					end
+				end
+
+				if before and before.t == "name" then
+					local resolved = resolvePlaceholder(tokens, before.v, ctx, depth + 1)
+					if resolved then
+						local base = sanitizeIdentifier(singularize(stripTableSuffix(resolved)))
+						if base then
+							return base
+						end
+					end
+				end
+			end
+
+			return "entry"
+		end
+
+		if last.t == "sym" and last.v == ")" then
+			local open = matchingOpen(tokens, to, from)
+			if open then
+				local firstArg, secondTok = tokens[open + 1], tokens[open + 2]
+				-- ? `download("Interiors", x)` -- the category names the thing, once singular
+				if
+					firstArg and firstArg.t == "str"
+					and secondTok and secondTok.t == "sym" and secondTok.v == ","
+				then
+					local raw = match(stringValue(firstArg), "([^:/%.]*)$")
+					if raw and #raw >= 3 and find(raw, "^[%a_][%w_]*$") then
+						local clean = sanitizeIdentifier(singularize(raw))
+						if clean then
+							return clean
+						end
+					end
+				end
+			end
+			return "result"
+		end
+
+		if last.t == "str" then
+			return "text"
+		end
+		if last.t == "num" then
+			return "number"
+		end
+		if last.t == "sym" and last.v == "}" then
+			return "data"
+		end
+
+		return "value"
+	end
+
+	--- Generic but readable parameter names for a function nothing else could describe.
+	local function parameterFallback(tokens, at, count)
+		if count == 1 then
+			-- ? `dynamic_location = function(p3)` -- the key it is stored under describes the argument
+			local eqTok, keyTok = tokens[at - 1], tokens[at - 2]
+			if
+				eqTok and eqTok.t == "sym" and eqTok.v == "="
+				and keyTok and keyTok.t == "name" and not KEYWORDS[keyTok.v]
+			then
+				local base = keyTok.v
+				for _, prefix in PARAM_KEY_PREFIXES do
+					if #base > #prefix and sub(base, 1, #prefix) == prefix then
+						base = sub(base, #prefix + 1)
+						break
+					end
+				end
+				local clean = sanitizeIdentifier(base)
+				if clean then
+					return { clean }
+				end
+			end
+		end
+
+		local generic = {}
+		for slot = 1, count do
+			generic[slot] = "arg" .. slot
+		end
+		return generic
+	end
+
+	--- Every `function NAME(...)` declaration, keyed by name.
+	local function namedFunctions(tokens, n)
+		local funcs, namePositions = {}, {}
+
+		for i = 1, n do
+			local tok = tokens[i]
+			if tok.t ~= "name" or tok.v ~= "function" then
+				continue
+			end
+
+			local j, limit = i + 1, i + 12
+			local lastName, lastAt
+
+			while j <= limit and tokens[j] and not (tokens[j].t == "sym" and tokens[j].v == "(") do
+				local cur = tokens[j]
+				if cur.t == "name" and not KEYWORDS[cur.v] then
+					lastName, lastAt = cur.v, j
+				end
+				j += 1
+			end
+
+			if not lastName then
+				continue
+			end
+
+			namePositions[lastAt] = true
+
+			local params = functionParams(tokens, i)
+			local list = funcs[lastName]
+			if not list then
+				list = {}
+				funcs[lastName] = list
+			end
+			list[#list + 1] = { at = i, params = params or {} }
+		end
+
+		return funcs, namePositions
+	end
+
+	--- The name an argument expression suggests: `x.house_owner` -> house_owner, `child` -> child.
+	local function argumentName(tokens, from, to)
+		if to > from + 1 then
+			local dot, last = tokens[to - 1], tokens[to]
+			if
+				dot.t == "sym" and dot.v == "." and last.t == "name" and not KEYWORDS[last.v]
+				and not BAD_FIELD_NAMES[last.v] and not isPlaceholderName(last.v)
+			then
+				return last.v
+			end
+		end
+
+		if from == to then
+			local only = tokens[from]
+			if
+				only.t == "name" and not KEYWORDS[only.v] and not BAD_FIELD_NAMES[only.v]
+				and not isPlaceholderName(only.v)
+			then
+				return only.v
+			end
+		end
+
+		return nil
+	end
+
+	--- Records, per function and per argument slot, every name its callers pass there.
+	local function callSiteNames(tokens, n, funcs, namePositions)
+		local found = {}
+
+		for i = 1, n do
+			local tok = tokens[i]
+			if tok.t ~= "name" or not funcs[tok.v] or namePositions[i] then
+				continue
+			end
+
+			local prev, nextTok = tokens[i - 1], tokens[i + 1]
+			if prev and prev.t == "sym" and (prev.v == "." or prev.v == ":") then
+				continue -- ? A field call, not this local function
+			end
+			if not (nextTok and nextTok.t == "sym" and nextTok.v == "(") then
+				continue
+			end
+
+			local slots = found[tok.v]
+			if not slots then
+				slots = {}
+				found[tok.v] = slots
+			end
+
+			local function record(slot, from, to)
+				local name = to >= from and argumentName(tokens, from, to)
+				if not name then
+					return
+				end
+				local bucket = slots[slot]
+				if not bucket then
+					bucket = {}
+					slots[slot] = bucket
+				end
+				bucket[#bucket + 1] = name
+			end
+
+			local depth, j, start, slot = 0, i + 2, i + 2, 1
+
+			while tokens[j] do
+				local cur = tokens[j]
+				if cur.t == "sym" then
+					if OPENERS[cur.v] then
+						depth += 1
+					elseif CLOSERS[cur.v] then
+						if depth == 0 then
+							break
+						end
+						depth -= 1
+					elseif cur.v == "," and depth == 0 then
+						record(slot, start, j - 1)
+						slot += 1
+						start = j + 1
+					end
+				end
+				j += 1
+			end
+
+			if tokens[j] then
+				record(slot, start, j - 1)
+			end
+		end
+
+		return found
+	end
+
+	--- `function` token index -> desired parameter names, learned from how callers actually call it.
+	local function inferParameterNames(tokens, n, aggressive)
+		local funcs, namePositions = namedFunctions(tokens, n)
+		local callers = callSiteNames(tokens, n, funcs, namePositions)
+		local inferred = {}
+
+		for name, declarations in funcs do
+			if #declarations ~= 1 then
+				continue -- ? Two functions share this name, so the call sites are ambiguous
+			end
+
+			local declaration = declarations[1]
+			local params = declaration.params
+			local paramCount = #params
+			if paramCount == 0 then
+				continue
+			end
+
+			local wanted, any = {}, false
+			local slots = callers[name]
+
+			if slots then
+				for slot, bucket in slots do
+					if slot > paramCount then
+						continue
+					end
+
+					local tally, best, bestScore = {}, nil, 0
+					for _, candidate in bucket do
+						local score = (tally[candidate] or 0) + 1
+						tally[candidate] = score
+						-- ? Most popular answer wins; ties go to whoever called first
+						if score > bestScore then
+							best, bestScore = candidate, score
+						end
+					end
+
+					local unanimous = bestScore == #bucket
+					-- ? Without aggressive naming we only act when every caller agrees
+					if unanimous or aggressive then
+						local clean = sanitizeIdentifier(best)
+						if clean then
+							wanted[slot] = clean
+							any = true
+						end
+					end
+				end
+			end
+
+			if paramCount == 1 and not wanted[1] then
+				for _, prefix in SETTER_PREFIXES do
+					if #name > #prefix and sub(name, 1, #prefix) == prefix then
+						local clean = sanitizeIdentifier(sub(name, #prefix + 1))
+						if clean then
+							wanted[1] = clean
+							any = true
+						end
+						break
+					end
+				end
+			end
+
+			if any then
+				inferred[declaration.at] = wanted
+			end
+		end
+
+		return inferred
+	end
+
+	--- One scope aware pass: names locals, loop variables and known event handler parameters.
+	---
+	--- Locals and loop variables are renamed by name (a decompiler numbers each uniquely), so the chosen
+	--- name only has to avoid what is live at that point -- which lets sibling functions each get their
+	--- own `ClientStore`. Handler parameters are renamed per occurrence instead, because `p1` is the
+	--- first parameter of *every* function and only this one means `hit`.
+	local function planRewrites(tokens, n, used, declared, declaredCount, assigned, inferredParams, aggressive, sources)
+		local renames, inlines, drops, tokenRenames = {}, {}, {}, {}
+		local blocks, blockCount, active, scopeDepth = {}, 0, {}, 0
+		local expectDo = false
+
+		local function lookupParam(name)
+			for k = blockCount, 1, -1 do
+				local scope = blocks[k].scope
+				if scope then
+					local hit = scope[name]
+					if hit ~= nil then
+						return hit ~= false and hit or nil
+					end
+				end
+			end
+			return nil
+		end
+
+		local function pick(base, separator)
+			local candidate, suffix = base, 1
+			while used[candidate] or active[candidate] do
+				suffix += 1
+				candidate = base .. separator .. suffix
+			end
+			return candidate
+		end
+
+		local function pushBlock(freed, scope)
+			blockCount += 1
+			blocks[blockCount] = { freed = freed or {}, scope = scope }
+			if scope then
+				scopeDepth += 1
+			end
+		end
+
+		local function popBlock()
+			local block = blocks[blockCount]
+			if not block then
+				return
+			end
+			blocks[blockCount] = nil
+			blockCount -= 1
+			if block.scope then
+				scopeDepth -= 1
+			end
+			for _, name in block.freed do
+				active[name] = nil
+			end
+		end
+
+		--- Marks a chosen name live until the enclosing block closes.
+		local function bind(name)
+			active[name] = true
+			if blockCount > 0 then
+				local freed = blocks[blockCount].freed
+				freed[#freed + 1] = name
+			end
+		end
+
+		for i = 1, n do
+			local tok = tokens[i]
+			if tok.t ~= "name" then
+				continue
+			end
+
+			local v = tok.v
+
+			if not KEYWORDS[v] then
+				if scopeDepth > 0 then
+					local prev = tokens[i - 1]
+					if not (prev and prev.t == "sym" and (prev.v == "." or prev.v == ":")) then
+						local mapped = lookupParam(v)
+						if mapped then
+							tokenRenames[i] = mapped
+						end
+					end
+				end
+				continue
+			end
+
+			if v == "end" or v == "until" then
+				popBlock()
+			elseif v == "repeat" or v == "if" then
+				pushBlock()
+			elseif v == "do" then
+				if expectDo then
+					expectDo = false -- ? Belongs to the `for`/`while` header that already pushed
+				else
+					pushBlock()
+				end
+			elseif v == "while" then
+				expectDo = true
+				pushBlock()
+			elseif v == "local" then
+				local nameTok, eqTok = tokens[i + 1], tokens[i + 2]
+				if
+					not nameTok or nameTok.t ~= "name" or KEYWORDS[nameTok.v]
+					or not eqTok or eqTok.t ~= "sym" or eqTok.v ~= "="
+				then
+					continue -- ? Multi-name declarations and `local function` are left alone
+				end
+
+				local name = nameTok.v
+				if renames[name] or inlines[name] or declaredCount[name] ~= 1 then
+					continue
+				end
+				if assigned[name] and not aggressive then
+					continue -- ? A reassigned local has no single value to name it after
+				end
+
+				local last = expressionRange(tokens, n, i + 3)
+				if last < i + 3 then
+					continue
+				end
+
+				local only = last == i + 3 and tokens[i + 3] or nil
+				if
+					only and only.t == "name" and isPlaceholderName(name)
+					and INLINEABLE_GLOBALS[only.v] and not declared[only.v] and not assigned[only.v]
+				then
+					inlines[name] = only.v
+					drops[i] = last -- ? The alias declaration itself becomes dead
+					continue
+				end
+
+				local suggestion = sanitizeIdentifier(embeddedName(name))
+				if not suggestion and isPlaceholderName(name) then
+					suggestion = suggestFromExpression(tokens, i + 3, last)
+					if not suggestion and aggressive then
+						local ctx = {
+							name = name,
+							declarations = sources.declarations,
+							assignments = sources.assignments,
+							loops = sources.loops,
+						}
+						suggestion = sanitizeIdentifier(fallbackName(tokens, i + 3, last, ctx))
+					end
+				end
+
+				if suggestion and isPlaceholderName(suggestion) then
+					suggestion = nil -- ? A placeholder is no better than the one we already have
+				end
+				if not suggestion and aggressive and isPlaceholderName(name) then
+					suggestion = "value"
+				end
+
+				if suggestion and suggestion ~= name then
+					local chosen = pick(suggestion, "_")
+					renames[name] = chosen
+					bind(chosen)
+				end
+			elseif v == "function" then
+				local wanted
+				local p1, p2, p3, p4 = tokens[i - 1], tokens[i - 2], tokens[i - 3], tokens[i - 4]
+				if
+					p1 and p1.t == "sym" and p1.v == "("
+					and p2 and p2.t == "name" and CONNECT_METHODS[p2.v]
+					and p3 and p3.t == "sym" and p3.v == ":"
+					and p4 and p4.t == "name"
+				then
+					wanted = EVENT_PARAMS[p4.v]
+				end
+
+				if wanted == nil then
+					wanted = inferredParams[i]
+				end
+
+				local params, paramCount = functionParams(tokens, i)
+
+				if aggressive and paramCount > 0 then
+					-- ? Nothing is left with a decompiler name, even when we had to invent one
+					local generic = parameterFallback(tokens, i, paramCount)
+					local filled = {}
+					for slot = 1, paramCount do
+						filled[slot] = wanted and wanted[slot] or generic[slot]
+					end
+					wanted = filled
+				end
+
+				local scope, claimed, claimedCount = nil, {}, 0
+
+				for slot = 1, paramCount do
+					local pname = params[slot]
+					local want = wanted and wanted[slot]
+
+					if want and isPlaceholderName(pname) and not renames[pname] and not inlines[pname] then
+						local chosen = pick(want, "_")
+						scope = scope or {}
+						scope[pname] = chosen
+						active[chosen] = true
+						claimedCount += 1
+						claimed[claimedCount] = chosen
+					elseif scopeDepth > 0 and lookupParam(pname) then
+						scope = scope or {}
+						scope[pname] = false -- ? An outer handler's name must not leak into this function
+					end
+				end
+
+				pushBlock(claimed, scope)
+			elseif v == "for" then
+				expectDo = true
+
+				local vars, varCount, generic, j = {}, 0, false, i + 1
+
+				while tokens[j] do
+					local cur = tokens[j]
+					if cur.t == "name" and not KEYWORDS[cur.v] then
+						varCount += 1
+						vars[varCount] = cur.v
+					elseif cur.t == "name" and cur.v == "in" then
+						generic = true
+						break
+					elseif not (cur.t == "sym" and cur.v == ",") then
+						break
+					end
+					j += 1
+				end
+
+				local claimed, claimedCount = {}, 0
+
+				for slot = 1, varCount do
+					local name = vars[slot]
+					local base = slot == 1 and "i" or (generic and slot == 2 and "v" or nil)
+
+					if base and isPlaceholderName(name) and not renames[name] and not inlines[name] then
+						local chosen = pick(base, "")
+						renames[name] = chosen
+						active[chosen] = true
+						claimedCount += 1
+						claimed[claimedCount] = chosen
+					end
+				end
+
+				pushBlock(claimed)
+			end
+		end
+
+		return renames, inlines, drops, tokenRenames
+	end
+
+	--- Marks statement level `print(...)` calls for removal.
+	local function planPrintRemoval(tokens, n, drops)
+		for i = 1, n do
+			local tok = tokens[i]
+			if tok.t ~= "name" or tok.v ~= "print" then
+				continue
+			end
+
+			local prev = tokens[i - 1]
+			if prev then
+				if prev.t == "sym" then
+					if not STMT_PREV_SYMBOLS[prev.v] then
+						continue -- ? `f(print)`, `local x = print`, `t.print` and friends are values, not statements
+					end
+				elseif prev.t == "name" and STMT_PREV_KEYWORD_BLOCK[prev.v] then
+					continue
+				end
+			end
+
+			local openTok = tokens[i + 1]
+			if not openTok then
+				continue
+			end
+
+			local last
+			if openTok.t == "str" then
+				last = i + 1
+			elseif openTok.t == "sym" and (openTok.v == "(" or openTok.v == "{") then
+				local depth, j = 0, i + 1
+				while tokens[j] do
+					local cur = tokens[j]
+					if cur.t == "sym" then
+						if OPENERS[cur.v] then
+							depth += 1
+						elseif CLOSERS[cur.v] then
+							depth -= 1
+							if depth == 0 then
+								last = j
+								break
+							end
+						end
+					end
+					j += 1
+				end
+			end
+
+			if not last then
+				continue
+			end
+
+			local after = tokens[last + 1]
+			if after and after.t == "sym" and after.v == ";" then
+				last += 1
+			end
+
+			drops[i] = last
+		end
+	end
+
+	local function rebuild(tokens, n, tail, drops)
+		local out, size, i = {}, 0, 1
+
+		while i <= n do
+			local stop = drops[i]
+			if stop then
+				i = stop + 1 -- ? Leading trivia goes with the dropped tokens, so the line collapses instead of going blank
+				continue
+			end
+
+			size += 1
+			out[size] = tokens[i].ws .. tokens[i].v
+			i += 1
+		end
+
+		size += 1
+		out[size] = tail
+
+		return table.concat(out)
+	end
+
+	--- Rewrites decompiler output so it reads closer to the script it came from.
+	--- @param src string -- Decompiled source
+	--- @param opts table -- { Rename: boolean, StripComments: boolean, RemovePrints: boolean, NameEverything: boolean }
+	--- @return string
+	function cleanDecompiledSource(src, opts)
+		local tokens, n, tail = tokenize(src)
+		if n == 0 then
+			return src
+		end
+
+		local changed = false
+
+		if opts.StripComments then
+			for i = 1, n do
+				local tok = tokens[i]
+				local filtered = filterTrivia(tok.ws, i == 1)
+				if filtered ~= tok.ws then
+					tok.ws = filtered
+					changed = true
+				end
+			end
+
+			local filteredTail = filterTrivia(tail)
+			if filteredTail ~= tail then
+				tail = filteredTail
+				changed = true
+			end
+		end
+
+		local declared, declaredCount, assigned = collectBindings(tokens, n)
+		local drops = {}
+
+		if opts.Rename then
+			local used = {}
+			for i = 1, n do
+				local tok = tokens[i]
+				if tok.t ~= "name" then
+					continue
+				end
+				local prev = tokens[i - 1]
+				if prev and prev.t == "sym" and (prev.v == "." or prev.v == ":") then
+					continue -- ? Field names live in their own namespace, they cannot clash with a variable
+				end
+				used[tok.v] = true
+			end
+
+			local aggressive = opts.NameEverything
+			local inferredParams = inferParameterNames(tokens, n, aggressive)
+
+			local declarations = declarationSources(tokens, n)
+			local sources = {
+				declarations = declarations,
+				assignments = assignmentSources(tokens, n),
+				loops = loopCollections(tokens, n, declarations),
+			}
+
+			local renames, inlines, tokenRenames
+			renames, inlines, drops, tokenRenames = planRewrites(
+				tokens, n, used, declared, declaredCount, assigned, inferredParams, aggressive, sources)
+
+			changed = changed or next(drops) ~= nil
+
+			for i = 1, n do
+				local tok = tokens[i]
+				if tok.t == "name" then
+					local mapped = tokenRenames[i] or inlines[tok.v] or renames[tok.v]
+					if mapped then
+						tok.v = mapped
+						changed = true
+					end
+				end
+			end
+		end
+
+		-- ? Runs on the rewritten tokens so aliases just folded back into `print` are stripped too
+		if opts.RemovePrints and not declared.print and not assigned.print then
+			planPrintRemoval(tokens, n, drops)
+			changed = changed or next(drops) ~= nil
+		end
+
+		if not changed then
+			return src
+		end
+
+		local output = rebuild(tokens, n, tail, drops)
+
+		if not find(src, "^%s") then
+			output = gsub(output, "^%s+", "") -- ? Dropping the very first statement would otherwise leave a blank line
+		end
+
+		return output
+	end
+end
 --[=[
     @class SynSaveInstance
     Represents the options for saving instances with custom settings using the synsaveinstance function.
@@ -3575,6 +5181,11 @@ end
 --- @field BytecodeTimeout number -- If the SaveBytecode run time exceeds this value it gets cancelled. Set to -1 to disable timeout. ___Default:___ 3
 --- @field DecompileJobless boolean -- Includes already decompiled code in the output. No new scripts are decompiled. ___Default:___ false
 --- @field SaveBytecode boolean -- Includes bytecode in the output. Useful if you wish to be able to decompile it yourself later. Respects **@DecompileIgnore**. ___Default:___ false
+--- @field CleanDecompiledSource boolean -- Rewrites decompiler output to read like the original script: placeholder locals (`u1`, `v3`, `l_Foo_2`) get real names taken from what they hold (`game:GetService("StarterGui")` becomes `StarterGui`, `load("HouseDB")` becomes `HouseDB`, `create_log()` becomes `log`), aliases like `local u1 = print` are folded back into the global, loop variables become `i`/`v`, handlers of well-known events get their documented parameter names (`.Touched:Connect(function(p1)` becomes `function(hit)`), and a named function's parameters are named after what every caller passes there (`f(item.reward_id)` makes `p1` into `reward_id`). Names are chosen per scope, so sibling functions can each have their own. Original local names are **not** kept in Luau bytecode, so this is a best-effort reconstruction and not the literal source; Roblox API names are unaffected either way, since those always survive compilation. ___Default:___ true
+--- @field NameEverything boolean -- Leaves **no** decompiler placeholder names in the output. Where the code says what a value is, the name is derived from it; where it does not, a readable generic is used instead (`result`, `value`, `data`, `firstChild`, `arg1`). Turn this off to keep `v21`-style names wherever nothing could be inferred, which makes it obvious which names are reconstructed and which are certain. Requires **@CleanDecompiledSource**. ___Default:___ true
+--- @field StripDecompilerComments boolean -- Removes every comment from decompiled scripts. Luau bytecode does not store comments, so anything present was written by the decompiler ("Decompiled with ...", "-- upvalues: ...", "-- line: 14", timing banners) and none of it was in the original script. Comments warning that the decompilation is incomplete (containing "warning", "error", "failed", "could not", "unsupported") are kept, since removing those would hide a broken result. Scripts recovered through **LinkedSource** are real source and are never touched, so their genuine comments survive. ___Default:___ true
+--- @field RemovePrints boolean -- Deletes every statement-level `print(...)` call from decompiled scripts. Off by default, since a game's own prints are part of the script. `print` used as a value (`pcall(print, x)`, `{print}`) is kept, and nothing is removed if the script rebinds `print` itself. Requires **@CleanDecompiledSource**. ___Default:___ false
+--- @field ScriptHeader boolean -- Prepends a "Saved by UniversalSynSaveInstance" credit (and the original-source URL for LinkedSource scripts) to every saved script. Off by default so saved scripts are just the script. ___Default:___ false
 --- .DecompileIgnore {Instance | Instance.ClassName | [Instance.ClassName] = {Instance.Name}} -- Ignores matched instances and their descendants by default. To ignore only the instance itself, set the value to `false`. Examples: `"Chat"` matches any instance with ClassName "Chat"; `Players = {"MyPlayerName"}` matches class "Players" AND name "MyPlayerName" only; `workspace` matches a specific instance by reference; `[workspace] = false` matches a specific instance by reference, ignoring only itself and not its descendants. ___Default:___ {TextChatService}
 --- .IgnoreList {Instance | Instance.ClassName | [Instance.ClassName] = {Instance.Name | false}} -- Structure mirrors **@DecompileIgnore**, except `false` means keep the instance but ignore its descendants. Supports both instance references and ClassName strings. Examples: `"CoreGui"` skips entirely; `CorePackages = false` keeps the instance but skips its descendants; `Players = {"SomePlayer"}` skips a specific named instance with specific ClassName. ___Default:___ {CoreGui, CorePackages, Packages = false}
 --- .ExtraInstances {Instance} -- If used with any invalid mode (like "invalidmode") it will only save these instances. ___Default:___ {}
@@ -3607,8 +5218,11 @@ end
 --- Alias → Canonical option mapping for the [SynSaveInstance.CustomOptions] table.
 --- Format: { Alias = CanonicalOption }
 --- These are resolved before user options are processed and cannot be modified at runtime.
+--- @field CleanSource string -- CleanDecompiledSource
+--- @field StripBanner string -- StripDecompilerComments
 --- @field Clipboard string -- CopyToClipboard
 --- @field DecompileScripts string -- Decompile
+--- @field Deobfuscate string -- CleanDecompiledSource
 --- @field FileName string -- FilePath
 --- @field IgnoreArchivable string -- IgnoreNotArchivable
 --- @field IgnoreDefaultProps string -- IgnoreDefaultProperties
@@ -3685,6 +5299,11 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		scriptcache = true,
 		SaveBytecode = false,
 		BytecodeTimeout = 3,
+		CleanDecompiledSource = true,
+		NameEverything = true,
+		StripDecompilerComments = true,
+		RemovePrints = false,
+		ScriptHeader = false,
 
 		__DEBUG_MODE = false,
 
@@ -3772,7 +5391,10 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 		OptionsAliases = { -- You can't really modify these as a user (because they're read before user's Options are loaded)
 			Clipboard = "CopyToClipboard",
+			CleanSource = "CleanDecompiledSource",
+			StripBanner = "StripDecompilerComments",
 			DecompileScripts = "Decompile",
+			Deobfuscate = "CleanDecompiledSource",
 			FileName = "FilePath",
 			IgnoreArchivable = "IgnoreNotArchivable",
 			IgnoreDefaultProps = "IgnoreDefaultProperties",
@@ -3974,9 +5596,6 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	end
 
 	local InstancesOverrides = {}
-	local ClassSerializableCache = {}
-	local ReflectionUsable
-	local HasAutoRemaps
 
 	local DecompileIgnore, IgnoreList, IgnoreProperties, NotCreatableFixes =
 		arrayToDict(OPTIONS.DecompileIgnore, true),
@@ -4446,6 +6065,8 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		getbytecode = makeTimeoutHandler(OPTIONS.BytecodeTimeout, getscriptbytecode) -- ? Solara fix
 	end
 
+	local ScriptHeader = OPTIONS.ScriptHeader
+
 	local SaveBytecode
 	if OPTIONS.SaveBytecode and getscriptbytecode then
 		SaveBytecode = function(script)
@@ -4463,6 +6084,30 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		end
 	elseif decompile then
 		local decomp = makeTimeoutHandler(OPTIONS.DecompileTimeout, decompile, "Decompiler timed out")
+
+		local cleanSource
+		do
+			local cleanupOptions = {
+				Rename = OPTIONS.CleanDecompiledSource,
+				StripComments = OPTIONS.StripDecompilerComments,
+				RemovePrints = OPTIONS.CleanDecompiledSource and OPTIONS.RemovePrints,
+				NameEverything = OPTIONS.CleanDecompiledSource and OPTIONS.NameEverything,
+			}
+
+			if cleanupOptions.Rename or cleanupOptions.StripComments then
+				cleanSource = function(source)
+					-- ? Never let a bug in the cleanup cost us the decompilation itself
+					local ok, cleaned = pcall(cleanDecompiledSource, source, cleanupOptions)
+					if ok and cleaned then
+						return cleaned
+					end
+					if __DEBUG_MODE then
+						__DEBUG_MODE("Source cleanup failed", cleaned)
+					end
+					return source
+				end
+			end
+		end
 
 		ldecompile = function(script)
 			-- local name = scr.ClassName .. scr.Name
@@ -4503,7 +6148,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			local output
 			if ok then
 				result = string.gsub(result, "\0", "\\0") -- ? Some decompilers sadly output \0 which prevents files from opening
-				output = result
+				output = cleanSource and cleanSource(result) or result
 			else
 				output = "--[[ Failed to decompile. Reason:\n" .. (result or "") .. "\n]]"
 			end
@@ -4607,9 +6252,11 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			end
 		end
 
-		value = "-- Saved by UniversalSynSaveInstance (Join to Copy Games) https://discord.gg/wx4ThpAsmw\n\n"
-			.. (hasLinkedSource and "-- Original Source: https://assetdelivery.roblox.com/v1/asset/?" .. (LinkedSource_type or "id") .. "=" .. (LinkedSource or LinkedSource_Url) .. "\n\n" or "")
-			.. value
+		if ScriptHeader then
+			value = "-- Saved by UniversalSynSaveInstance (Join to Copy Games) https://discord.gg/wx4ThpAsmw\n\n"
+				.. (hasLinkedSource and "-- Original Source: https://assetdelivery.roblox.com/v1/asset/?" .. (LinkedSource_type or "id") .. "=" .. (LinkedSource or LinkedSource_Url) .. "\n\n" or "")
+				.. value
+		end
 
 		return value
 	end
@@ -4629,48 +6276,11 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		return InstanceOverride
 	end
 
-	local function isClassSerializable(className)
-		local known = ClassSerializableCache[className]
-		if known ~= nil then
-			return known
-		end
-
-		local function getSerialized(name)
-			return pcall(function()
-				return service.ReflectionService:GetClass(name, REFLECTION_FILTER).Serialized -- ! Some executors (like Xeno) error on ReflectionService due to their ProxyService
-			end)
-		end
-
-		if ReflectionUsable == nil then
-			local ok, partSerialized = getSerialized("Part")
-			ReflectionUsable = not RiskyServicesDisabled.Reflection and ok and partSerialized == true
-		end
-
-		local serializable = true
-		if ReflectionUsable then
-			local ok, serialized = getSerialized(className)
-			serializable = not ok or serialized == true -- ? Serialized is either true or nil, NEVER false
-		end
-
-		ClassSerializableCache[className] = serializable
-		return serializable
-	end
-
 	local function refIsInvalid(target, valueType)
-		if not target then
+		if not SaveNotCreatableWillBeEnabled or not target then
 			return false
 		end
-		local className = target.ClassName
-
-		local fix = NotCreatableFixes[className] or nil
-		if fix then
-			if not SaveNotCreatableWillBeEnabled then
-				return false -- collect drops these outright rather than remapping them
-			end
-		elseif not isClassSerializable(className) then
-			-- collect remaps these no matter what SaveNotCreatable says
-			fix = "Folder"
-		end
+		local fix = NotCreatableFixes[target.ClassName]
 		return fix ~= nil and (valueType ~= "Instance" and valueType ~= fix)
 	end
 
@@ -5002,23 +6612,15 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 						return -- They won't show up in Studio anyway (Enable SaveNotCreatable if you wish to bypass this)
 					end
 					class, override = fix, replaceClassName(instance, name, class)
-					if class == "Folder" then
-						propClass = "Instance"
-					end
 				elseif TreatUnionsAsParts and instance:IsA("PartOperation") then
 					class, override = "Part", replaceClassName(instance, name, class)
 					propClass = "BasePart"
-				elseif not isClassSerializable(class) then
-					class, override, propClass = "Folder", replaceClassName(instance, name, class), "Instance"
-					HasAutoRemaps = true
 				elseif not ClassList[class] then
 					if __DEBUG_MODE then
 						__DEBUG_MODE("Class not Found", class)
 					end
-					unknownTag, class, propClass = class, "Folder", "Instance"
+					unknownTag, class = class, "Folder"
 				end
-			elseif tagOverride == "Folder" then
-				propClass = "Instance"
 			end
 
 			local e = {
@@ -5319,7 +6921,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 					end
 
 					if encoder and typeId then
-						if (SaveNotCreatableWillBeEnabled or HasAutoRemaps) and prop.Category == "Class" then
+						if SaveNotCreatableWillBeEnabled and prop.Category == "Class" then
 							for i = 1, n do
 								if refIsInvalid(vals[i], valueType) then
 									vals[i] = nil
