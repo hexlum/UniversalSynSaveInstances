@@ -164,6 +164,12 @@ pcall(function()
 	makefolder(USSI_FOLDER)
 end)
 
+local REFLECTION_FILTER = {
+	Security = SecurityCapabilities.new(unpack(Enum.SecurityCapability:GetEnumItems())),
+	ExcludeDisplay = true,
+	ExcludeInherited = true,
+}
+
 local Type_Ids = {
 	["string"] = 1,
 	["bool"] = 2,
@@ -3065,9 +3071,6 @@ do
 
 		local API_Dump
 
-		local Max_SecurityCapabilities = SecurityCapabilities.new(unpack(Enum.SecurityCapability:GetEnumItems()))
-		local filter = { Security = Max_SecurityCapabilities, ExcludeDisplay = true, ExcludeInherited = true }
-
 		-- ! exact version match is preferred, mismatched dump versions might result in saveinstance trying to save properties that your client doesn't have yet
 		local APIDUMP_FETCHERS = {
 			[1] = function()
@@ -3216,7 +3219,7 @@ do
 					Region3Int16 = "Region3int16",
 				}
 
-				for _, api_class in service.ReflectionService:GetClasses(filter) do
+				for _, api_class in service.ReflectionService:GetClasses(REFLECTION_FILTER) do
 					local members, members_size = {}, 1
 					local className = api_class.Name
 
@@ -3244,7 +3247,7 @@ do
 						service.ReflectionService.GetPropertiesOfClass,
 						service.ReflectionService,
 						className,
-						filter
+						REFLECTION_FILTER
 					) -- ? Might produce errors (ex. RolloutValidation) therefore pcall
 					if o then
 						for _, property in r do
@@ -3407,7 +3410,7 @@ do
 										service.ReflectionService.GetPropertiesOfClass,
 										service.ReflectionService,
 										ClassName,
-										filter
+										REFLECTION_FILTER
 									)
 									if o then
 										for _, property in properties do
@@ -3611,11 +3614,6 @@ do
 		PromptButtonHoldBegan = { "prompt", "player" },
 	}
 
-	-- ? Luau bytecode does not store comments, so every comment in decompiled output was written by the
-	-- ? decompiler: banners, "-- upvalues: ...", "-- line: 14". All of it goes, except anything warning
-	-- ? that the decompilation itself is incomplete -- deleting that would hide a real problem.
-	local KEEP_COMMENT_SUBSTRINGS =
-		{ "warning", "error", "fail", "could not", "unable", "unsupported", "unhandled", "incomplete" }
 
 	-- ? Verbs a call name wears in front of the thing it actually returns
 	local CALL_PREFIXES_SNAKE = { "get_", "create_", "make_", "new_", "fetch_", "build_" }
@@ -3633,17 +3631,10 @@ do
 	local TABLE_SUFFIXES = { "DB", "Db", "Data", "Table", "Map", "List", "Cache", "Registry" }
 	local ITERATORS = arrayToDict({ "pairs", "ipairs", "next" })
 
-	-- ? A `print` is a statement only if the token before it can legally end one
-	local STMT_PREV_SYMBOLS = arrayToDict({ ";", ")", "]", "}" })
-	local STMT_PREV_KEYWORD_BLOCK =
-		arrayToDict({ "function", "local", "return", "and", "or", "not", "in", "if", "elseif", "while", "until", "for" })
 
 	local COMPOUND_ASSIGN = arrayToDict({ "=", "+=", "-=", "*=", "/=", "%=", "^=", "..=", "//=" })
 	local OPENERS = arrayToDict({ "(", "{", "[" })
 	local CLOSERS = arrayToDict({ ")", "}", "]" })
-
-	local MARK = string.char(1) -- ? Stands in for a removed comment until we know whether its line is now empty
-	local MARK_LINE = "[ \t]*" .. MARK .. "[ \t" .. MARK .. "]*"
 
 	local function readLongBracket(src, i)
 		local j, level = i + 1, 0
@@ -3745,86 +3736,6 @@ do
 		return tokens, n, sub(src, wsStart)
 	end
 
-	local function isNoiseComment(text)
-		local lowered = lower(text)
-		for _, needle in KEEP_COMMENT_SUBSTRINGS do
-			if find(lowered, needle, 1, true) then
-				return false
-			end
-		end
-		return true
-	end
-
-	--- Drops decompiler comments, and the line they sat on, from one run of trivia.
-	--- @param atLineStart boolean? -- Whether this run begins a line; only then may a banner at its very start take a newline with it
-	local function filterTrivia(ws, atLineStart)
-		if not find(ws, "--", 1, true) or find(ws, MARK, 1, true) then
-			return ws
-		end
-
-		local pieces, count = {}, 0
-		local i, len, plainStart, found = 1, #ws, 1, false
-
-		while i <= len do
-			if sub(ws, i, i) == "-" and sub(ws, i + 1, i + 1) == "-" then
-				if i > plainStart then
-					count += 1
-					pieces[count] = sub(ws, plainStart, i - 1)
-				end
-
-				local j = i + 2
-				local stop = sub(ws, j, j) == "[" and readLongBracket(ws, j)
-				if not stop then
-					stop = find(ws, "\n", j, true) or len + 1
-				end
-
-				local text = sub(ws, i, stop - 1)
-				count += 1
-				if isNoiseComment(text) then
-					pieces[count] = MARK
-					found = true
-				else
-					pieces[count] = text
-				end
-
-				i = stop
-				plainStart = stop
-			else
-				i += 1
-			end
-		end
-
-		if len >= plainStart then
-			count += 1
-			pieces[count] = sub(ws, plainStart, len)
-		end
-
-		if not found then
-			return ws
-		end
-
-		local marked = table.concat(pieces)
-		local collapsing = true
-
-		while collapsing do
-			local c1, c2, c3 = 0, 0, 0
-			if atLineStart then
-				marked, c1 = gsub(marked, "^" .. MARK_LINE .. "\n", "")
-			end
-			marked, c2 = gsub(marked, "(\n)" .. MARK_LINE .. "\n", "%1")
-			marked, c3 = gsub(marked, "(\n)" .. MARK_LINE .. "$", "%1")
-			collapsing = c1 + c2 + c3 > 0
-		end
-
-		if atLineStart then
-			marked = gsub(marked, "^" .. MARK_LINE .. "$", "")
-		end
-
-		marked = gsub(marked, MARK, "")
-
-		return (gsub(marked, "[ \t]+\n", "\n"))
-	end
-
 	local function stringValue(token)
 		local v = token.v
 		return match(v, "^%[=*%[(.*)%]=*%]$") or sub(v, 2, -2)
@@ -3842,28 +3753,6 @@ do
 			return nil
 		end
 		return name
-	end
-
-	--- `p: function` is not legal Luau -- the parser rejects the keyword outright, which is why
-	--- Studio reports "Using 'function' as a type annotation is not supported". Decompilers emit it
-	--- anyway, so rewrite it to the form Luau accepts. The token is retyped so nothing downstream
-	--- mistakes it for a function definition.
-	local function fixFunctionTypeAnnotations(tokens, n)
-		local changed = 0
-
-		for i = 1, n do
-			local tok = tokens[i]
-			if tok.t ~= "name" or tok.v ~= "function" or not isTypeAnnotationFunction(tokens, i) then
-				continue
-			end
-
-			-- ? Always parenthesised: a bare `(...any) -> ...any` binds wrong inside a union or before `?`
-			tok.v = "((...any) -> ...any)"
-			tok.t = "type"
-			changed += 1
-		end
-
-		return changed
 	end
 
 	-- ? Konstant marks upvalue reads and writes by suffixing the name: `load_upvr`, `v3_upvw`, `Config_upvr_2`
@@ -5196,65 +5085,6 @@ do
 		return renames, inlines, drops, tokenRenames
 	end
 
-	--- Marks statement level `print(...)` calls for removal.
-	local function planPrintRemoval(tokens, n, drops)
-		for i = 1, n do
-			local tok = tokens[i]
-			if tok.t ~= "name" or tok.v ~= "print" then
-				continue
-			end
-
-			local prev = tokens[i - 1]
-			if prev then
-				if prev.t == "sym" then
-					if not STMT_PREV_SYMBOLS[prev.v] then
-						continue -- ? `f(print)`, `local x = print`, `t.print` and friends are values, not statements
-					end
-				elseif prev.t == "name" and STMT_PREV_KEYWORD_BLOCK[prev.v] then
-					continue
-				end
-			end
-
-			local openTok = tokens[i + 1]
-			if not openTok then
-				continue
-			end
-
-			local last
-			if openTok.t == "str" then
-				last = i + 1
-			elseif openTok.t == "sym" and (openTok.v == "(" or openTok.v == "{") then
-				local depth, j = 0, i + 1
-				while tokens[j] do
-					local cur = tokens[j]
-					if cur.t == "sym" then
-						if OPENERS[cur.v] then
-							depth += 1
-						elseif CLOSERS[cur.v] then
-							depth -= 1
-							if depth == 0 then
-								last = j
-								break
-							end
-						end
-					end
-					j += 1
-				end
-			end
-
-			if not last then
-				continue
-			end
-
-			local after = tokens[last + 1]
-			if after and after.t == "sym" and after.v == ";" then
-				last += 1
-			end
-
-			drops[i] = last
-		end
-	end
-
 	local function rebuild(tokens, n, tail, drops)
 		local out, size, i = {}, 0, 1
 
@@ -5276,39 +5106,23 @@ do
 		return table.concat(out)
 	end
 
-	--- Rewrites decompiler output so it reads closer to the script it came from.
+	--- Renames a decompiler's placeholder locals (`u1`, `v3`, `p1`, `l_Foo_2`) so the output reads like
+	--- the script it came from. Names are taken from what each value holds, from how callers pass it,
+	--- and from Roblox event signatures; anything left over gets a readable generic.
+	---
+	--- Nothing else is touched. Comments, formatting, prints, type annotations and every statement stay
+	--- exactly as the decompiler produced them, except `local u1 = print` aliases, which are folded back
+	--- into the global they point at -- that one cannot be expressed as a rename.
+	---
 	--- @param src string -- Decompiled source
-	--- @param opts table -- { Rename: boolean, StripComments: boolean, RemovePrints: boolean, NameEverything: boolean }
 	--- @return string
-	function cleanDecompiledSource(src, opts)
+	function cleanDecompiledSource(src)
 		local tokens, n, tail = tokenize(src)
 		if n == 0 then
 			return src
 		end
 
 		local changed = false
-
-		if opts.StripComments then
-			for i = 1, n do
-				local tok = tokens[i]
-				local filtered = filterTrivia(tok.ws, i == 1)
-				if filtered ~= tok.ws then
-					tok.ws = filtered
-					changed = true
-				end
-			end
-
-			local filteredTail = filterTrivia(tail)
-			if filteredTail ~= tail then
-				tail = filteredTail
-				changed = true
-			end
-		end
-
-		if fixFunctionTypeAnnotations(tokens, n) > 0 then
-			changed = true
-		end
-
 		local declared, declaredCount, assigned = collectBindings(tokens, n)
 
 		if normalizeUpvalueMarkers(tokens, n, declaredCount) > 0 then
@@ -5316,55 +5130,42 @@ do
 			declared, declaredCount, assigned = collectBindings(tokens, n)
 		end
 
-		local drops = {}
-
-		if opts.Rename then
-			local used = {}
-			for i = 1, n do
-				local tok = tokens[i]
-				if tok.t ~= "name" then
-					continue
-				end
-				local prev = tokens[i - 1]
-				if prev and prev.t == "sym" and (prev.v == "." or prev.v == ":") then
-					continue -- ? Field names live in their own namespace, they cannot clash with a variable
-				end
-				used[tok.v] = true
+		local used = {}
+		for i = 1, n do
+			local tok = tokens[i]
+			if tok.t ~= "name" then
+				continue
 			end
-
-			local aggressive = opts.NameEverything
-			local inferredParams = inferParameterNames(tokens, n, aggressive)
-
-			local declarations = declarationSources(tokens, n)
-			local sources = {
-				declarations = declarations,
-				assignments = assignmentSources(tokens, n),
-				loops = loopCollections(tokens, n, declarations),
-				firstAssignments = firstAssignments(tokens, n),
-			}
-
-			local renames, inlines, tokenRenames
-			renames, inlines, drops, tokenRenames = planRewrites(
-				tokens, n, used, declared, declaredCount, assigned, inferredParams, aggressive, sources)
-
-			changed = changed or next(drops) ~= nil
-
-			for i = 1, n do
-				local tok = tokens[i]
-				if tok.t == "name" then
-					local mapped = tokenRenames[i] or inlines[tok.v] or renames[tok.v]
-					if mapped then
-						tok.v = mapped
-						changed = true
-					end
-				end
+			local prev = tokens[i - 1]
+			if prev and prev.t == "sym" and (prev.v == "." or prev.v == ":") then
+				continue -- ? Field names live in their own namespace, they cannot clash with a variable
 			end
+			used[tok.v] = true
 		end
 
-		-- ? Runs on the rewritten tokens so aliases just folded back into `print` are stripped too
-		if opts.RemovePrints and not declared.print and not assigned.print then
-			planPrintRemoval(tokens, n, drops)
-			changed = changed or next(drops) ~= nil
+		local declarations = declarationSources(tokens, n)
+		local sources = {
+			declarations = declarations,
+			assignments = assignmentSources(tokens, n),
+			loops = loopCollections(tokens, n, declarations),
+			firstAssignments = firstAssignments(tokens, n),
+		}
+
+		local inferredParams = inferParameterNames(tokens, n, true)
+		local renames, inlines, drops, tokenRenames =
+			planRewrites(tokens, n, used, declared, declaredCount, assigned, inferredParams, true, sources)
+
+		changed = changed or next(drops) ~= nil
+
+		for i = 1, n do
+			local tok = tokens[i]
+			if tok.t == "name" then
+				local mapped = tokenRenames[i] or inlines[tok.v] or renames[tok.v]
+				if mapped then
+					tok.v = mapped
+					changed = true
+				end
+			end
 		end
 
 		if not changed then
@@ -5374,12 +5175,14 @@ do
 		local output = rebuild(tokens, n, tail, drops)
 
 		if not find(src, "^%s") then
-			output = gsub(output, "^%s+", "") -- ? Dropping the very first statement would otherwise leave a blank line
+			output = gsub(output, "^%s+", "") -- ? Folding away the first statement would leave a blank line
 		end
 
 		return output
 	end
 end
+
+
 --[=[
     @class SynSaveInstance
     Represents the options for saving instances with custom settings using the synsaveinstance function.
@@ -5410,12 +5213,8 @@ end
 --- @field DecompileTimeout number -- If the decompilation run time exceeds this value it gets cancelled. Set to -1 to disable timeout. ___Default:___ 10
 --- @field BytecodeTimeout number -- If the SaveBytecode run time exceeds this value it gets cancelled. Set to -1 to disable timeout. ___Default:___ 3
 --- @field DecompileJobless boolean -- Includes already decompiled code in the output. No new scripts are decompiled. ___Default:___ false
+--- @field RenameDecompiledVariables boolean -- Renames the placeholder locals a decompiler emits (`u1`, `v3`, `p1`, `l_Foo_2`) to names taken from what each value holds, how callers pass it, and Roblox event signatures. **Only names change** -- comments, formatting, prints, type annotations and every statement are left exactly as the decompiler produced them. ___Default:___ true
 --- @field SaveBytecode boolean -- Includes bytecode in the output. Useful if you wish to be able to decompile it yourself later. Respects **@DecompileIgnore**. ___Default:___ false
---- @field CleanDecompiledSource boolean -- Rewrites decompiler output to read like the original script: placeholder locals (`u1`, `v3`, `l_Foo_2`) get real names taken from what they hold (`game:GetService("StarterGui")` becomes `StarterGui`, `load("HouseDB")` becomes `HouseDB`, `create_log()` becomes `log`), aliases like `local u1 = print` are folded back into the global, loop variables become `i`/`v`, handlers of well-known events get their documented parameter names (`.Touched:Connect(function(p1)` becomes `function(hit)`), and a named function's parameters are named after what every caller passes there (`f(item.reward_id)` makes `p1` into `reward_id`). Names are chosen per scope, so sibling functions can each have their own. Original local names are **not** kept in Luau bytecode, so this is a best-effort reconstruction and not the literal source; Roblox API names are unaffected either way, since those always survive compilation. ___Default:___ true
---- @field NameEverything boolean -- Leaves **no** decompiler placeholder names in the output. Where the code says what a value is, the name is derived from it; where it does not, a readable generic is used instead (`result`, `value`, `data`, `firstChild`, `arg1`). Turn this off to keep `v21`-style names wherever nothing could be inferred, which makes it obvious which names are reconstructed and which are certain. Requires **@CleanDecompiledSource**. ___Default:___ true
---- @field StripDecompilerComments boolean -- Removes every comment from decompiled scripts. Luau bytecode does not store comments, so anything present was written by the decompiler ("Decompiled with ...", "-- upvalues: ...", "-- line: 14", timing banners) and none of it was in the original script. Comments warning that the decompilation is incomplete (containing "warning", "error", "failed", "could not", "unsupported") are kept, since removing those would hide a broken result. Scripts recovered through **LinkedSource** are real source and are never touched, so their genuine comments survive. ___Default:___ true
---- @field RemovePrints boolean -- Deletes every statement-level `print(...)` call from decompiled scripts. Off by default, since a game's own prints are part of the script. `print` used as a value (`pcall(print, x)`, `{print}`) is kept, and nothing is removed if the script rebinds `print` itself. Requires **@CleanDecompiledSource**. ___Default:___ false
---- @field ScriptHeader boolean -- Prepends a "Saved by UniversalSynSaveInstance" credit (and the original-source URL for LinkedSource scripts) to every saved script. Off by default so saved scripts are just the script. ___Default:___ false
 --- .DecompileIgnore {Instance | Instance.ClassName | [Instance.ClassName] = {Instance.Name}} -- Ignores matched instances and their descendants by default. To ignore only the instance itself, set the value to `false`. Examples: `"Chat"` matches any instance with ClassName "Chat"; `Players = {"MyPlayerName"}` matches class "Players" AND name "MyPlayerName" only; `workspace` matches a specific instance by reference; `[workspace] = false` matches a specific instance by reference, ignoring only itself and not its descendants. ___Default:___ {TextChatService}
 --- .IgnoreList {Instance | Instance.ClassName | [Instance.ClassName] = {Instance.Name | false}} -- Structure mirrors **@DecompileIgnore**, except `false` means keep the instance but ignore its descendants. Supports both instance references and ClassName strings. Examples: `"CoreGui"` skips entirely; `CorePackages = false` keeps the instance but skips its descendants; `Players = {"SomePlayer"}` skips a specific named instance with specific ClassName. ___Default:___ {CoreGui, CorePackages, Packages = false}
 --- .ExtraInstances {Instance} -- If used with any invalid mode (like "invalidmode") it will only save these instances. ___Default:___ {}
@@ -5448,11 +5247,8 @@ end
 --- Alias → Canonical option mapping for the [SynSaveInstance.CustomOptions] table.
 --- Format: { Alias = CanonicalOption }
 --- These are resolved before user options are processed and cannot be modified at runtime.
---- @field CleanSource string -- CleanDecompiledSource
---- @field StripBanner string -- StripDecompilerComments
 --- @field Clipboard string -- CopyToClipboard
 --- @field DecompileScripts string -- Decompile
---- @field Deobfuscate string -- CleanDecompiledSource
 --- @field FileName string -- FilePath
 --- @field IgnoreArchivable string -- IgnoreNotArchivable
 --- @field IgnoreDefaultProps string -- IgnoreDefaultProperties
@@ -5528,12 +5324,8 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		-- decomptype = "",
 		scriptcache = true,
 		SaveBytecode = false,
+		RenameDecompiledVariables = true,
 		BytecodeTimeout = 3,
-		CleanDecompiledSource = true,
-		NameEverything = true,
-		StripDecompilerComments = true,
-		RemovePrints = false,
-		ScriptHeader = false,
 
 		__DEBUG_MODE = false,
 
@@ -5621,10 +5413,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 
 		OptionsAliases = { -- You can't really modify these as a user (because they're read before user's Options are loaded)
 			Clipboard = "CopyToClipboard",
-			CleanSource = "CleanDecompiledSource",
-			StripBanner = "StripDecompilerComments",
 			DecompileScripts = "Decompile",
-			Deobfuscate = "CleanDecompiledSource",
 			FileName = "FilePath",
 			IgnoreArchivable = "IgnoreNotArchivable",
 			IgnoreDefaultProps = "IgnoreDefaultProperties",
@@ -5826,6 +5615,9 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	end
 
 	local InstancesOverrides = {}
+	local ClassSerializableCache = {}
+	local ReflectionUsable
+	local HasAutoRemaps
 
 	local DecompileIgnore, IgnoreList, IgnoreProperties, NotCreatableFixes =
 		arrayToDict(OPTIONS.DecompileIgnore, true),
@@ -6295,8 +6087,6 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		getbytecode = makeTimeoutHandler(OPTIONS.BytecodeTimeout, getscriptbytecode) -- ? Solara fix
 	end
 
-	local ScriptHeader = OPTIONS.ScriptHeader
-
 	local SaveBytecode
 	if OPTIONS.SaveBytecode and getscriptbytecode then
 		SaveBytecode = function(script)
@@ -6315,27 +6105,18 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	elseif decompile then
 		local decomp = makeTimeoutHandler(OPTIONS.DecompileTimeout, decompile, "Decompiler timed out")
 
-		local cleanSource
-		do
-			local cleanupOptions = {
-				Rename = OPTIONS.CleanDecompiledSource,
-				StripComments = OPTIONS.StripDecompilerComments,
-				RemovePrints = OPTIONS.CleanDecompiledSource and OPTIONS.RemovePrints,
-				NameEverything = OPTIONS.CleanDecompiledSource and OPTIONS.NameEverything,
-			}
-
-			if cleanupOptions.Rename or cleanupOptions.StripComments then
-				cleanSource = function(source)
-					-- ? Never let a bug in the cleanup cost us the decompilation itself
-					local ok, cleaned = pcall(cleanDecompiledSource, source, cleanupOptions)
-					if ok and cleaned then
-						return cleaned
-					end
-					if __DEBUG_MODE then
-						__DEBUG_MODE("Source cleanup failed", cleaned)
-					end
-					return source
+		local renameSource
+		if OPTIONS.RenameDecompiledVariables then
+			renameSource = function(source)
+				-- ? Never let a bug in the renamer cost us the decompilation itself
+				local ok, renamed = pcall(cleanDecompiledSource, source)
+				if ok and renamed then
+					return renamed
 				end
+				if __DEBUG_MODE then
+					__DEBUG_MODE("Variable renaming failed", renamed)
+				end
+				return source
 			end
 		end
 
@@ -6378,7 +6159,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			local output
 			if ok then
 				result = string.gsub(result, "\0", "\\0") -- ? Some decompilers sadly output \0 which prevents files from opening
-				output = cleanSource and cleanSource(result) or result
+				output = renameSource and renameSource(result) or result
 			else
 				output = "--[[ Failed to decompile. Reason:\n" .. (result or "") .. "\n]]"
 			end
@@ -6482,11 +6263,9 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			end
 		end
 
-		if ScriptHeader then
-			value = "-- Saved by UniversalSynSaveInstance (Join to Copy Games) https://discord.gg/wx4ThpAsmw\n\n"
-				.. (hasLinkedSource and "-- Original Source: https://assetdelivery.roblox.com/v1/asset/?" .. (LinkedSource_type or "id") .. "=" .. (LinkedSource or LinkedSource_Url) .. "\n\n" or "")
-				.. value
-		end
+		value = "-- Saved by UniversalSynSaveInstance (Join to Copy Games) https://discord.gg/wx4ThpAsmw\n\n"
+			.. (hasLinkedSource and "-- Original Source: https://assetdelivery.roblox.com/v1/asset/?" .. (LinkedSource_type or "id") .. "=" .. (LinkedSource or LinkedSource_Url) .. "\n\n" or "")
+			.. value
 
 		return value
 	end
@@ -6506,11 +6285,48 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		return InstanceOverride
 	end
 
+	local function isClassSerializable(className)
+		local known = ClassSerializableCache[className]
+		if known ~= nil then
+			return known
+		end
+
+		local function getSerialized(name)
+			return pcall(function()
+				return service.ReflectionService:GetClass(name, REFLECTION_FILTER).Serialized -- ! Some executors (like Xeno) error on ReflectionService due to their ProxyService
+			end)
+		end
+
+		if ReflectionUsable == nil then
+			local ok, partSerialized = getSerialized("Part")
+			ReflectionUsable = not RiskyServicesDisabled.Reflection and ok and partSerialized == true
+		end
+
+		local serializable = true
+		if ReflectionUsable then
+			local ok, serialized = getSerialized(className)
+			serializable = not ok or serialized == true -- ? Serialized is either true or nil, NEVER false
+		end
+
+		ClassSerializableCache[className] = serializable
+		return serializable
+	end
+
 	local function refIsInvalid(target, valueType)
-		if not SaveNotCreatableWillBeEnabled or not target then
+		if not target then
 			return false
 		end
-		local fix = NotCreatableFixes[target.ClassName]
+		local className = target.ClassName
+
+		local fix = NotCreatableFixes[className] or nil
+		if fix then
+			if not SaveNotCreatableWillBeEnabled then
+				return false -- collect drops these outright rather than remapping them
+			end
+		elseif not isClassSerializable(className) then
+			-- collect remaps these no matter what SaveNotCreatable says
+			fix = "Folder"
+		end
 		return fix ~= nil and (valueType ~= "Instance" and valueType ~= fix)
 	end
 
@@ -6842,15 +6658,23 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 						return -- They won't show up in Studio anyway (Enable SaveNotCreatable if you wish to bypass this)
 					end
 					class, override = fix, replaceClassName(instance, name, class)
+					if class == "Folder" then
+						propClass = "Instance"
+					end
 				elseif TreatUnionsAsParts and instance:IsA("PartOperation") then
 					class, override = "Part", replaceClassName(instance, name, class)
 					propClass = "BasePart"
+				elseif not isClassSerializable(class) then
+					class, override, propClass = "Folder", replaceClassName(instance, name, class), "Instance"
+					HasAutoRemaps = true
 				elseif not ClassList[class] then
 					if __DEBUG_MODE then
 						__DEBUG_MODE("Class not Found", class)
 					end
-					unknownTag, class = class, "Folder"
+					unknownTag, class, propClass = class, "Folder", "Instance"
 				end
+			elseif tagOverride == "Folder" then
+				propClass = "Instance"
 			end
 
 			local e = {
@@ -7151,7 +6975,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 					end
 
 					if encoder and typeId then
-						if SaveNotCreatableWillBeEnabled and prop.Category == "Class" then
+						if (SaveNotCreatableWillBeEnabled or HasAutoRemaps) and prop.Category == "Class" then
 							for i = 1, n do
 								if refIsInvalid(vals[i], valueType) then
 									vals[i] = nil
