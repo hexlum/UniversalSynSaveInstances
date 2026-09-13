@@ -4893,6 +4893,11 @@ do
 							end
 						end
 
+						if isFunc then
+							-- ? `local function v36()` -- a function name is not ours to invent
+							nameCount = 0
+						end
+
 						for slot = 1, nameCount do
 							local nm = names[slot]
 							if renames[nm] or inlines[nm] or declaredCount[nm] ~= 1 then
@@ -4911,9 +4916,7 @@ do
 							}
 
 							local base
-							if isFunc then
-								base = "fn"
-							elseif rhsFrom then
+							if rhsFrom then
 								base = suggestFromExpression(tokens, rhsFrom, rhsTo)
 									or fallbackName(tokens, rhsFrom, rhsTo, ctx)
 							else
@@ -5213,7 +5216,7 @@ end
 --- @field DecompileTimeout number -- If the decompilation run time exceeds this value it gets cancelled. Set to -1 to disable timeout. ___Default:___ 10
 --- @field BytecodeTimeout number -- If the SaveBytecode run time exceeds this value it gets cancelled. Set to -1 to disable timeout. ___Default:___ 3
 --- @field DecompileJobless boolean -- Includes already decompiled code in the output. No new scripts are decompiled. ___Default:___ false
---- @field RenameDecompiledVariables boolean -- Renames the placeholder locals a decompiler emits (`u1`, `v3`, `p1`, `l_Foo_2`) to names taken from what each value holds, how callers pass it, and Roblox event signatures. **Only names change** -- comments, formatting, prints, type annotations and every statement are left exactly as the decompiler produced them. ___Default:___ true
+--- @field RenameDecompiledVariables boolean -- Renames the placeholder locals a decompiler emits (`u1`, `v3`, `l_Foo_2`) using what the code says each value is, so `local v2 = game:GetService("StarterGui")` becomes `local StarterGui = ...`. Loop variables become `i`/`v`, and `local u1 = print` aliases fold back into the global. **Only local variable names change** -- function names, parameters, comments, formatting, prints and every statement are left exactly as the decompiler produced them, and a local the code cannot describe keeps its placeholder. ___Default:___ true
 --- @field SaveBytecode boolean -- Includes bytecode in the output. Useful if you wish to be able to decompile it yourself later. Respects **@DecompileIgnore**. ___Default:___ false
 --- .DecompileIgnore {Instance | Instance.ClassName | [Instance.ClassName] = {Instance.Name}} -- Ignores matched instances and their descendants by default. To ignore only the instance itself, set the value to `false`. Examples: `"Chat"` matches any instance with ClassName "Chat"; `Players = {"MyPlayerName"}` matches class "Players" AND name "MyPlayerName" only; `workspace` matches a specific instance by reference; `[workspace] = false` matches a specific instance by reference, ignoring only itself and not its descendants. ___Default:___ {TextChatService}
 --- .IgnoreList {Instance | Instance.ClassName | [Instance.ClassName] = {Instance.Name | false}} -- Structure mirrors **@DecompileIgnore**, except `false` means keep the instance but ignore its descendants. Supports both instance references and ClassName strings. Examples: `"CoreGui"` skips entirely; `CorePackages = false` keeps the instance but skips its descendants; `Players = {"SomePlayer"}` skips a specific named instance with specific ClassName. ___Default:___ {CoreGui, CorePackages, Packages = false}
@@ -6105,9 +6108,9 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	elseif decompile then
 		local decomp = makeTimeoutHandler(OPTIONS.DecompileTimeout, decompile, "Decompiler timed out")
 
-		local renameSource
+		local renameLocals
 		if OPTIONS.RenameDecompiledVariables then
-			renameSource = function(source)
+			renameLocals = function(source)
 				-- ? Never let a bug in the renamer cost us the decompilation itself
 				local ok, renamed = pcall(cleanDecompiledSource, source)
 				if ok and renamed then
@@ -6159,7 +6162,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			local output
 			if ok then
 				result = string.gsub(result, "\0", "\\0") -- ? Some decompilers sadly output \0 which prevents files from opening
-				output = renameSource and renameSource(result) or result
+				output = renameLocals and renameLocals(result) or result
 			else
 				output = "--[[ Failed to decompile. Reason:\n" .. (result or "") .. "\n]]"
 			end
